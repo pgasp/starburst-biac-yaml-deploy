@@ -24,8 +24,24 @@ YAML file, via the BIAC REST API.
 
 1. Copy `.env.example` to `.env.<cluster-name>` and fill in real
    credentials. **Never commit this file** — it's gitignored.
-2. Copy `examples/example-acme.yaml` and adapt it to your actual roles,
-   tables, columns, and masking expressions.
+2. Copy `examples/example-acme.yaml` (generic template) and adapt it to
+   your actual roles, tables, columns, and masking expressions.
+
+## Examples included
+
+- `examples/example-acme.yaml` — generic, minimal template (placeholder
+  names throughout).
+- `examples/acme-datahub-profils.yaml` — the actual `poc_profile_open` /
+  `poc_profile_restricted` configuration validated on the internal demo cluster:
+  unrestricted raw-table access vs. governed-view-only access with a
+  salted-hash column mask on `id_col`. Row-level security (region
+  filtering) is documented in the file's header comment but must be
+  configured manually — it's out of scope for this tool (row filters
+  aren't supported in v1).
+- `examples/acme-sales_5m-decrypt.yaml` — the `poc_profile_decrypt`
+  configuration for the `secret_col` AES-256 decryption use case. Requires
+  the `decrypt_secret_col` UDF to already be deployed on the cluster — read the
+  prerequisite comment at the top of the file before applying.
 
 ## Usage
 
