@@ -54,11 +54,65 @@ python3 biac_deploy.py --env .env.lab --config config.yaml --apply
 
 # 3. Read back the current state of everything declared in the config
 python3 biac_deploy.py --env .env.lab --config config.yaml --verify
+
+# If config.yaml uses entity_ref (see "Environments" below), add:
+#   --environment environments/<your-cluster>.yaml
 ```
+
+## Environments — reusing the same policy across clusters
+
+Catalog/schema/table names are rarely the same twice: a demo cluster and a
+real production cluster (or two different clients) will name the same
+logical table differently. Hardcoding `catalog: iceberg, schema: datahub,
+table: vact` into every grant/mask ties the whole policy file to one
+specific cluster.
+
+Instead, a policy file can reference an entity by **logical name**:
+
+```yaml
+grants:
+  - role: poc_profile_restricted
+    effect: ALLOW
+    action: SELECT
+    entity_ref: vact_governed   # resolved via --environment, not hardcoded
+```
+
+and a separate **environment file** maps each `entity_ref` to the real
+catalog/schema/table (or function) *for one specific cluster*:
+
+```yaml
+# environments/demo-lab.yaml
+entities:
+  vact_governed: {catalog: iceberg, schema: datahub, table: vact}
+```
+
+Run the same policy file against different clusters just by swapping
+`--environment`:
+
+```bash
+python3 biac_deploy.py --env .env.lab --config examples/acme-datahub-profils.yaml \
+    --environment environments/demo-lab.yaml --dry-run
+
+python3 biac_deploy.py --env .env.acme-prod --config examples/acme-datahub-profils.yaml \
+    --environment environments/acme-prod.yaml --dry-run
+```
+
+To reproduce a policy on a new cluster: copy `environments/_template.yaml`
+to `environments/<your-cluster-name>.yaml` and replace every `REPLACE_ME`
+with the real name on that cluster — the policy file itself never changes.
+
+`entity_ref` and inline `entity:` blocks can both be used (even in the same
+file, on different items) — use `entity_ref` for anything that needs to
+move between clusters, and inline `entity:` for something genuinely
+cluster-specific that will never be reused elsewhere. A config that uses
+`entity_ref` without passing `--environment` fails validation immediately,
+before any network call — it never silently falls back to a guess.
 
 ## Config format
 
-See `examples/example-acme.yaml` for a complete, commented example.
+See `examples/example-acme.yaml` for a complete, commented example using
+inline `entity:` blocks, or `examples/acme-datahub-profils.yaml` for one
+using `entity_ref` (see "Environments" above).
 
 ```yaml
 roles:
@@ -68,7 +122,7 @@ grants:
   - role: <role name declared above>
     effect: ALLOW | DENY | ALLOW_WITH_GRANT_OPTION
     action: SELECT | EXECUTE | INSERT | ...
-    entity:
+    entity:                 # OR entity_ref: <name defined in --environment>
       category: TABLES | FUNCTIONS
       catalog: <catalog>
       schema: <schema>
@@ -80,7 +134,7 @@ column_masks:
     description: <free text>
     expression: <SQL expression referencing the column>
     role: <role name declared above>
-    entity:
+    entity:                 # OR entity_ref: <name> + columns: [<column>]
       category: TABLES
       catalog: <catalog>
       schema: <schema>
