@@ -4,14 +4,15 @@ Deploy Starburst SEP BIAC entitlements (roles, grants, column masks, row
 filters, assignments) declared in a YAML file, via the BIAC REST API.
 
 Usage:
-    python3 biac_deploy.py --env .env.lab --config config.yaml --dry-run
-    python3 biac_deploy.py --env .env.lab --config config.yaml --apply
-    python3 biac_deploy.py --env .env.lab --config config.yaml --verify
+    python3 biac_deploy.py --env .env.lab --config environments/demo-lab/biac.yaml --dry-run
+    python3 biac_deploy.py --env .env.lab --config environments/demo-lab/biac.yaml --apply
+    python3 biac_deploy.py --env .env.lab --config environments/demo-lab/biac.yaml --verify
 
-    # config using entity_ref (portable across clusters where catalog/
-    # schema/table names differ) requires an environment file:
-    python3 biac_deploy.py --env .env.lab --config config.yaml \\
-        --environment environments/demo-lab.yaml --dry-run
+Each cluster/environment gets its own folder under environments/<name>/,
+containing its biac.yaml (real catalog/schema/table names for that cluster)
+and its views.sql (schema + view creation for that cluster). Catalog/schema/
+table names are hardcoded per-environment — there is no cross-environment
+templating; copy an environment folder and edit both files to add a new one.
 
 Design:
 - Idempotent: before creating any object, the existing cluster state is
@@ -23,13 +24,6 @@ Design:
 - allEntities:true is never emitted — every entity is fully scoped
   (catalog/schema/table or catalog/schema/function), matching the BIAC API
   constraint that allEntities:true forbids any other attribute.
-- Environments: a policy config (roles/grants/masks structure) can reference
-  entities by logical name (`entity_ref: vact_governed`) instead of hardcoding
-  catalog/schema/table. An --environment file then maps each entity_ref to
-  the real catalog/schema/table (or function) for a given cluster — the same
-  policy config can be replayed against a demo cluster and a production
-  cluster with completely different schema/table names, without duplicating
-  or rewriting the grants/masks themselves.
 """
 import argparse
 import base64
@@ -68,60 +62,9 @@ def load_env(path):
     return env
 
 
-def load_environment(path):
-    """Loads an environment file: a mapping of logical entity_ref names to
-    the real catalog/schema/table (or catalog/schema/function) they resolve
-    to on a given cluster. See environments/_template.yaml."""
-    with open(path) as f:
-        data = yaml.safe_load(f) or {}
-    entities = data.get("entities", {})
-    if not isinstance(entities, dict):
-        raise ValueError(f"{path}: 'entities' must be a mapping of name -> {{catalog, schema, table|function}}")
-    for name, e in entities.items():
-        if not isinstance(e, dict):
-            raise ValueError(f"{path}: entity '{name}' must be a mapping, got {type(e).__name__}")
-        has_table = "table" in e
-        has_function = "function" in e
-        if has_table == has_function:  # both or neither
-            raise ValueError(f"{path}: entity '{name}' must have exactly one of 'table' or 'function'")
-        if not e.get("catalog") or not e.get("schema"):
-            raise ValueError(f"{path}: entity '{name}' missing 'catalog' or 'schema'")
-    return entities
-
-
-def resolve_config_entities(config, environment):
-    """Replaces every 'entity_ref' in grants/column_masks with the resolved
-    'entity' dict from the environment mapping. Mutates and returns config.
-    Items that already use inline 'entity' are left untouched — entity_ref
-    and inline entity are two ways to write the same thing, not required to
-    be used together in the same config."""
-    for section in ("grants", "column_masks"):
-        for item in config.get(section, []):
-            if "entity_ref" not in item:
-                continue
-            if "entity" in item:
-                raise ValueError(f"{section} item for role {item.get('role')!r}: "
-                                  f"specify either 'entity' or 'entity_ref', not both")
-            ref = item.pop("entity_ref")
-            if environment is None:
-                raise ValueError(f"{section} item for role {item.get('role')!r} uses "
-                                  f"entity_ref '{ref}' but no --environment file was given")
-            if ref not in environment:
-                raise ValueError(f"entity_ref '{ref}' not found in environment file "
-                                  f"(available: {sorted(environment)})")
-            base = dict(environment[ref])
-            category = "FUNCTIONS" if "function" in base else "TABLES"
-            entity = {"category": category, **base}
-            if "columns" in item:
-                entity["columns"] = item.pop("columns")
-            item["entity"] = entity
-    return config
-
-
-def load_config(path, environment=None):
+def load_config(path):
     with open(path) as f:
         config = yaml.safe_load(f) or {}
-    resolve_config_entities(config, environment)
     validate_config(config)
     return config
 
@@ -506,11 +449,7 @@ def verify(client, config):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--env", required=True, help="Path to .env file (SB_HOST/SB_PORT/SB_USER/SB_PASSWORD)")
-    p.add_argument("--config", required=True, help="Path to YAML entitlements config")
-    p.add_argument("--environment",
-                    help="Path to an environment file resolving entity_ref names to real "
-                         "catalog/schema/table (or function) — required only if --config uses "
-                         "entity_ref instead of inline 'entity' blocks")
+    p.add_argument("--config", required=True, help="Path to environments/<name>/biac.yaml")
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true", help="Print the plan, no writes")
     mode.add_argument("--apply", action="store_true", help="Execute the plan")
@@ -520,8 +459,7 @@ def main():
     env = load_env(args.env)
     print(f"Cluster: {env['SB_HOST']}:{env['SB_PORT']}  User: {env['SB_USER']}  Password: ****")
 
-    environment = load_environment(args.environment) if args.environment else None
-    config = load_config(args.config, environment)
+    config = load_config(args.config)
     client = BiacClient(env)
 
     if args.dry_run:
