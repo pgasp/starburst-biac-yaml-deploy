@@ -113,20 +113,34 @@ def validate_config(config):
     def check_entity(entity, context):
         if entity.get("allEntities") is True:
             errors.append(f"{context}: allEntities:true is forbidden by this tool "
-                           f"— scope the entity explicitly (catalog/schema/table)")
+                           f"— scope the entity explicitly (catalog, or catalog+schema, "
+                           f"or catalog+schema+table/function)")
             return
+        # A catalog-wide or schema-wide grant is expressed by OMITTING the
+        # narrower field(s) entirely — 'catalog' alone means catalog.*,
+        # 'catalog'+'schema' alone means catalog.schema.*. A literal '*'
+        # string is NOT the mechanism for this (confirmed on staging,
+        # 2026-10-01) — reject it explicitly so it's never confused with
+        # omission.
+        for field in ("schema", "table", "function"):
+            if entity.get(field) == "*":
+                errors.append(f"{context}: '*' is not a valid wildcard for '{field}' — "
+                               f"omit '{field}' entirely instead for a catalog/schema-wide grant")
         category = entity.get("category")
-        if category == "TABLES":
-            for field in ("catalog", "schema", "table"):
-                if not entity.get(field):
-                    errors.append(f"{context}: TABLES entity missing '{field}'")
-        elif category == "FUNCTIONS":
-            for field in ("catalog", "schema", "function"):
-                if not entity.get(field):
-                    errors.append(f"{context}: FUNCTIONS entity missing '{field}'")
-        else:
+        if category not in ("TABLES", "FUNCTIONS"):
             errors.append(f"{context}: unsupported or missing entity category {category!r} "
                            f"(expected TABLES or FUNCTIONS)")
+            return
+        if not entity.get("catalog"):
+            errors.append(f"{context}: entity missing 'catalog'")
+        if category == "TABLES" and entity.get("function"):
+            errors.append(f"{context}: TABLES entity must not set 'function'")
+        if category == "FUNCTIONS" and entity.get("table"):
+            errors.append(f"{context}: FUNCTIONS entity must not set 'table'")
+        narrow_field = "table" if category == "TABLES" else "function"
+        if entity.get(narrow_field) and not entity.get("schema"):
+            errors.append(f"{context}: '{narrow_field}' given without 'schema' "
+                           f"— a {narrow_field} always needs its schema specified")
 
     known_grant_keys = {"role", "effect", "action", "entity"}
     for g in config.get("grants", []):
@@ -163,6 +177,9 @@ def validate_config(config):
         entity = m.get("entity", {})
         if not entity.get("columns"):
             errors.append(f"column_mask {m.get('name')!r}: entity must list 'columns'")
+        if not entity.get("table"):
+            errors.append(f"column_mask {m.get('name')!r}: entity must specify a 'table' "
+                           f"— a column mask always targets one specific table, never catalog/schema-wide")
         check_entity(entity, f"column_mask {m.get('name')!r}")
 
     if config.get("row_filters"):
@@ -395,10 +412,10 @@ def plan(client, config):
 
 
 def describe_entity(entity):
-    if entity.get("category") == "FUNCTIONS":
-        base = f"{entity.get('catalog')}.{entity.get('schema')}.{entity.get('function')}"
-    else:
-        base = f"{entity.get('catalog')}.{entity.get('schema')}.{entity.get('table')}"
+    narrow_field = "function" if entity.get("category") == "FUNCTIONS" else "table"
+    parts = [entity.get("catalog"), entity.get("schema"), entity.get(narrow_field)]
+    parts = [p for p in parts if p]  # catalog-only or catalog+schema grants omit the rest
+    base = ".".join(parts) + (".*" if len(parts) < 3 else "")
     if entity.get("columns"):
         base += f".{','.join(entity['columns'])}"
     return base

@@ -75,13 +75,13 @@ roles:
 grants:
   - role: <role name declared above>
     effect: ALLOW | DENY | ALLOW_WITH_GRANT_OPTION
-    action: SELECT | EXECUTE | INSERT | ...
+    action: SELECT | EXECUTE | INSERT | ...   # or a list: [SELECT, INSERT, ...]
     entity:
       category: TABLES | FUNCTIONS
       catalog: <catalog>
-      schema: <schema>
-      table: <table>        # TABLES only
-      function: <function>  # FUNCTIONS only
+      schema: <schema>      # omit entirely for a catalog-wide grant
+      table: <table>        # TABLES only — omit for a schema-wide grant
+      function: <function>  # FUNCTIONS only — omit for a schema-wide grant
 
 column_masks:
   - name: <expression name, unique>
@@ -101,16 +101,33 @@ assignments:
     groups: [<groupname>, ...]
 ```
 
+## Catalog-wide and schema-wide grants
+
+A grant (or column mask) can target an entire catalog or schema instead of
+one table, by **omitting** the narrower field(s) — not by setting them to
+`'*'` (confirmed by testing against a real cluster, 2026-10-01: a literal
+`'*'` is rejected by this tool's validator):
+
+```yaml
+entity: {category: TABLES, catalog: datahub}                  # catalog.*
+entity: {category: TABLES, catalog: datahub, schema: my_schema} # catalog.schema.*
+```
+
+A column mask always targets one specific table (it masks specific
+columns), so `table` is required there regardless.
+
 ## Security notes
 
 - `allEntities: true` is rejected by this tool at validation time — every
-  entity must name its catalog/schema/table (or catalog/schema/function)
-  explicitly. This is deliberate: `allEntities: true` combined with any
-  other attribute is invalid per the BIAC API, and broad grants are a
-  common source of over-permissioning.
-- BIAC grants with an empty/wildcard table (schema-wide) do NOT reliably
-  work (confirmed on the acme demo — `PERMISSION_DENIED` despite the grant
-  existing) — every grant is explicit, per-table.
+  entity must name its catalog (and, narrower, schema/table or
+  schema/function) explicitly, or use the catalog/schema-wide omission
+  above. This is deliberate: `allEntities: true` combined with any other
+  attribute is invalid per the BIAC API, and broad grants are a common
+  source of over-permissioning.
+- An EMPTY string for schema/table (as opposed to omitting the field) does
+  NOT reliably work (confirmed on the acme demo — `PERMISSION_DENIED` despite
+  the grant existing). Use an explicit per-table grant, or omit the field
+  entirely for a real catalog/schema-wide grant (see above) — never `""`.
 - The script never deletes, revokes, or overwrites anything. Re-running it
   against an unchanged config is a no-op (idempotent).
 - `--apply` always prints the full plan and requires typing `yes` before
