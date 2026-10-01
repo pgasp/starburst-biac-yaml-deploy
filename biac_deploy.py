@@ -343,11 +343,20 @@ class BiacClient:
         return resp
 
 
+def _norm(v):
+    # The BIAC API normalizes catalog/schema/table/function names to
+    # lowercase regardless of the case sent (confirmed on lab, 2026-10-01:
+    # 'sales_5m' sent, 'sales_5m' stored) — compare case-insensitively so
+    # idempotency checks don't false-negative into recreating the same
+    # grant/mask on every run.
+    return v.lower() if isinstance(v, str) else v
+
+
 def entities_equal(a, b):
     keys = {"category", "catalog", "schema", "table", "function"}
-    a_cols = sorted(a.get("columns", []) or [])
-    b_cols = sorted(b.get("columns", []) or [])
-    return (all(a.get(k) == b.get(k) for k in keys) and a_cols == b_cols)
+    a_cols = sorted(_norm(c) for c in (a.get("columns") or []))
+    b_cols = sorted(_norm(c) for c in (b.get("columns") or []))
+    return (all(_norm(a.get(k)) == _norm(b.get(k)) for k in keys) and a_cols == b_cols)
 
 
 # --------------------------------------------------------------------------
