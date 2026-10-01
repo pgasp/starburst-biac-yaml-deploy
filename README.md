@@ -68,6 +68,18 @@ See `environments/demo-lab/biac.yaml` for a complete, commented real example
 (the acme datahub `poc_profile_open` / `poc_profile_restricted` /
 `poc_profile_decrypt` policy).
 
+**Style convention — keep every grant on one flow-style line**, even when
+`action` is a list:
+```yaml
+- {role: poc_profile_open, effect: ALLOW, action: [CREATE, DELETE, SELECT], entity: {category: TABLES, catalog: iceberg}}
+```
+Mixing flow-style (`{...}`) and block-style (one key per line) for the same
+kind of entry invites exactly the kind of broken-YAML edit this project hit
+twice (an unquoted comma, and later a stray `{`/`}` wrapped around
+block-style lines). `column_masks` entries are the one exception — they stay
+block-style (one key per line) since they're multi-field with nested
+`entity`/`columns`, too long to read comfortably on one line.
+
 ```yaml
 roles:
   - name: <lowercase_a-z0-9_only>
