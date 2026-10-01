@@ -69,6 +69,28 @@ def load_config(path):
     return config
 
 
+MAX_DESCRIPTION_LENGTH = 250  # BIAC API limit, confirmed by testing against a real cluster
+
+
+def grant_actions(g):
+    """A grant's 'action' may be a single string or a YAML list of strings
+    (one API call will be made per action). A comma-separated STRING is
+    deliberately NOT supported: '{action: CREATE,DELETE,SELECT}' inside a
+    YAML flow mapping does not mean what it looks like — the unquoted comma
+    is parsed as a mapping separator, silently producing 'action: CREATE'
+    plus bogus extra keys (DELETE, SELECT, ... each with value null), not a
+    multi-action grant. This was hit for real and is now caught explicitly
+    by validate_config's unknown-key check. Use a YAML list instead:
+        action: [CREATE, DELETE, SELECT]
+    """
+    a = g.get("action")
+    if isinstance(a, list):
+        return a
+    if isinstance(a, str):
+        return [a]
+    return []
+
+
 def validate_config(config):
     """Structural validation. Aborts (raises) on anything malformed or
     ambiguous — never guesses a default for a missing security-relevant
@@ -106,22 +128,38 @@ def validate_config(config):
             errors.append(f"{context}: unsupported or missing entity category {category!r} "
                            f"(expected TABLES or FUNCTIONS)")
 
+    known_grant_keys = {"role", "effect", "action", "entity"}
     for g in config.get("grants", []):
         role = g.get("role")
+        unknown_keys = set(g.keys()) - known_grant_keys
+        if unknown_keys:
+            errors.append(f"grant on role {role!r}: unknown key(s) {sorted(unknown_keys)} — "
+                           f"likely an unquoted comma inside a flow mapping (e.g. "
+                           f"'action: CREATE,DELETE,SELECT' does NOT mean a multi-action grant, "
+                           f"it's parsed as stray keys DELETE/SELECT with null values — "
+                           f"use 'action: [CREATE, DELETE, SELECT]' instead)")
         if role not in role_names:
             errors.append(f"grant references undeclared role: {role!r}")
         if g.get("effect") not in ("ALLOW", "DENY", "ALLOW_WITH_GRANT_OPTION"):
             errors.append(f"grant on role {role!r}: invalid or missing 'effect'")
-        if not g.get("action"):
-            errors.append(f"grant on role {role!r}: missing 'action'")
+        if not grant_actions(g):
+            errors.append(f"grant on role {role!r}: missing 'action' (string or list of strings)")
         check_entity(g.get("entity", {}), f"grant on role {role!r}")
 
+    known_mask_keys = {"name", "description", "expression", "role", "entity"}
     for m in config.get("column_masks", []):
         role = m.get("role")
+        unknown_keys = set(m.keys()) - known_mask_keys
+        if unknown_keys:
+            errors.append(f"column_mask {m.get('name')!r}: unknown key(s) {sorted(unknown_keys)}")
         if role not in role_names:
             errors.append(f"column_mask {m.get('name')!r} references undeclared role: {role!r}")
         if not m.get("expression"):
             errors.append(f"column_mask {m.get('name')!r}: missing 'expression'")
+        description = m.get("description", "")
+        if len(description) > MAX_DESCRIPTION_LENGTH:
+            errors.append(f"column_mask {m.get('name')!r}: description is {len(description)} "
+                           f"chars, exceeds the {MAX_DESCRIPTION_LENGTH}-char BIAC API limit")
         entity = m.get("entity", {})
         if not entity.get("columns"):
             errors.append(f"column_mask {m.get('name')!r}: entity must list 'columns'")
@@ -324,11 +362,12 @@ def plan(client, config):
 
     for g in config.get("grants", []):
         role_id = role_ids.get(g["role"])
-        label = f"{g['role']} -> {g['effect']} {g['action']} on {describe_entity(g['entity'])}"
-        if role_id and client.grant_exists(role_id, g["effect"], g["action"], g["entity"]):
-            actions.append(("grant", label, "SKIP (exists)"))
-        else:
-            actions.append(("grant", label, "CREATE" if not role_id else "CREATE"))
+        for action in grant_actions(g):
+            label = f"{g['role']} -> {g['effect']} {action} on {describe_entity(g['entity'])}"
+            if role_id and client.grant_exists(role_id, g["effect"], action, g["entity"]):
+                actions.append(("grant", label, "SKIP (exists)"))
+            else:
+                actions.append(("grant", label, "CREATE"))
 
     for m in config.get("column_masks", []):
         role_id = role_ids.get(m["role"])
@@ -392,13 +431,14 @@ def apply(client, config):
 
     for g in config.get("grants", []):
         role_id = role_ids[g["role"]]
-        if client.grant_exists(role_id, g["effect"], g["action"], g["entity"]):
-            print(f"[grant] {g['role']} {g['effect']} {g['action']} "
-                  f"{describe_entity(g['entity'])}: exists, skipping")
-        else:
-            client.create_grant(role_id, g["effect"], g["action"], g["entity"])
-            print(f"[grant] {g['role']} {g['effect']} {g['action']} "
-                  f"{describe_entity(g['entity'])}: created")
+        for action in grant_actions(g):
+            if client.grant_exists(role_id, g["effect"], action, g["entity"]):
+                print(f"[grant] {g['role']} {g['effect']} {action} "
+                      f"{describe_entity(g['entity'])}: exists, skipping")
+            else:
+                client.create_grant(role_id, g["effect"], action, g["entity"])
+                print(f"[grant] {g['role']} {g['effect']} {action} "
+                      f"{describe_entity(g['entity'])}: created")
 
     for m in config.get("column_masks", []):
         role_id = role_ids[m["role"]]
