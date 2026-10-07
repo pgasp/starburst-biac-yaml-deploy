@@ -21,6 +21,12 @@ Design:
   Any invalid or ambiguous entry aborts the whole run — nothing partial.
 - No implicit destructive action: this script never deletes or revokes
   anything. Drift detection / pruning is explicitly out of scope for v1.
+  This also means an existing grant/row filter/column mask can never be
+  changed in place (e.g. ALLOW -> ALLOW_WITH_GRANT_OPTION on the same
+  entity) — the BIAC API itself rejects a duplicate create in that case
+  (409 ALREADY_EXISTS, keyed on action+entity, ignoring effect). To change
+  an existing one, delete it on the cluster first (outside this tool), then
+  re-run --apply.
 - allEntities:true is never emitted — every entity is fully scoped
   (catalog/schema/table or catalog/schema/function), matching the BIAC API
   constraint that allEntities:true forbids any other attribute.
@@ -182,9 +188,28 @@ def validate_config(config):
                            f"— a column mask always targets one specific table, never catalog/schema-wide")
         check_entity(entity, f"column_mask {m.get('name')!r}")
 
-    if config.get("row_filters"):
-        errors.append("row_filters is not supported by this tool version (v1 scope: "
-                       "roles, grants, column_masks, assignments only) — remove this section")
+    known_rf_keys = {"name", "description", "expression", "role", "entity"}
+    for rf in config.get("row_filters", []):
+        role = rf.get("role")
+        unknown_keys = set(rf.keys()) - known_rf_keys
+        if unknown_keys:
+            errors.append(f"row_filter {rf.get('name')!r}: unknown key(s) {sorted(unknown_keys)}")
+        if role not in role_names:
+            errors.append(f"row_filter {rf.get('name')!r} references undeclared role: {role!r}")
+        if not rf.get("expression"):
+            errors.append(f"row_filter {rf.get('name')!r}: missing 'expression'")
+        description = rf.get("description", "")
+        if len(description) > MAX_DESCRIPTION_LENGTH:
+            errors.append(f"row_filter {rf.get('name')!r}: description is {len(description)} "
+                           f"chars, exceeds the {MAX_DESCRIPTION_LENGTH}-char BIAC API limit")
+        entity = rf.get("entity", {})
+        if not entity.get("table"):
+            errors.append(f"row_filter {rf.get('name')!r}: entity must specify a 'table' "
+                           f"— a row filter always targets one specific table, never catalog/schema-wide")
+        if entity.get("columns"):
+            errors.append(f"row_filter {rf.get('name')!r}: entity must not specify 'columns' "
+                           f"— row filters apply to whole rows, not specific columns (did you mean column_masks?)")
+        check_entity(entity, f"row_filter {rf.get('name')!r}")
 
     for a in config.get("assignments", []):
         role = a.get("role")
@@ -309,6 +334,43 @@ class BiacClient:
             raise RuntimeError(f"POST /roles/{role_id}/columnMasks failed: {status} {resp}")
         return resp
 
+    # --- row filter expressions ---
+    def list_row_filter_expressions(self):
+        status, body = self.call("GET", "/api/v1/biac/expressions/rowFilter")
+        if status != 200:
+            raise RuntimeError(f"GET /expressions/rowFilter failed: {status} {body}")
+        return body["result"]
+
+    def find_row_filter_expression(self, name):
+        return next((e for e in self.list_row_filter_expressions() if e["name"] == name), None)
+
+    def create_row_filter_expression(self, name, expression, description):
+        body = {"name": name, "expression": expression, "description": description}
+        status, resp = self.call("POST", "/api/v1/biac/expressions/rowFilter", body)
+        if status not in (200, 201):
+            raise RuntimeError(f"POST /expressions/rowFilter ({name}) failed: {status} {resp}")
+        return resp
+
+    # --- row filters (attachment to role) ---
+    def list_row_filters(self, role_id):
+        status, body = self.call("GET", f"/api/v1/biac/roles/{role_id}/rowFilters")
+        if status != 200:
+            raise RuntimeError(f"GET /roles/{role_id}/rowFilters failed: {status} {body}")
+        return body["result"]
+
+    def row_filter_attached(self, role_id, entity, expression_id):
+        for f in self.list_row_filters(role_id):
+            if f.get("expressionId") == expression_id and entities_equal(f.get("entity", {}), entity):
+                return True
+        return False
+
+    def attach_row_filter(self, role_id, entity, expression_id):
+        body = {"entity": entity, "expressionId": expression_id, "forceNone": False}
+        status, resp = self.call("POST", f"/api/v1/biac/roles/{role_id}/rowFilters", body)
+        if status not in (200, 201):
+            raise RuntimeError(f"POST /roles/{role_id}/rowFilters failed: {status} {resp}")
+        return resp
+
     # --- assignments ---
     def list_user_assignments(self, user):
         status, body = self.call("GET", f"/api/v1/biac/subjects/users/{user}/assignments")
@@ -404,6 +466,24 @@ def plan(client, config):
         else:
             actions.append(("column_mask_attach", label, "CREATE"))
 
+    rf_expr_ids = {}
+    for rf in config.get("row_filters", []):
+        existing = client.find_row_filter_expression(rf["name"])
+        if existing:
+            rf_expr_ids[rf["name"]] = existing["id"]
+            actions.append(("row_filter_expression", rf["name"], "SKIP (exists)"))
+        else:
+            actions.append(("row_filter_expression", rf["name"], "CREATE"))
+
+    for rf in config.get("row_filters", []):
+        role_id = role_ids.get(rf["role"])
+        expr_id = rf_expr_ids.get(rf["name"])
+        label = f"{rf['role']} -> rowfilter {describe_entity(rf['entity'])} := {rf['expression']}"
+        if role_id and expr_id and client.row_filter_attached(role_id, rf["entity"], expr_id):
+            actions.append(("row_filter_attach", label, "SKIP (exists)"))
+        else:
+            actions.append(("row_filter_attach", label, "CREATE"))
+
     for a in config.get("assignments", []):
         role_id = role_ids.get(a["role"])
         for user in a.get("users", []):
@@ -475,6 +555,28 @@ def apply(client, config):
             client.attach_column_mask(role_id, m["entity"], expr_id)
             print(f"[column_mask] {m['role']} -> {describe_entity(m['entity'])}: attached")
 
+    rf_expr_ids = {}
+    for rf in config.get("row_filters", []):
+        existing = client.find_row_filter_expression(rf["name"])
+        if existing:
+            rf_expr_ids[rf["name"]] = existing["id"]
+            print(f"[row_filter_expression] {rf['name']}: exists (id={existing['id']}), skipping")
+        else:
+            created = client.create_row_filter_expression(
+                rf["name"], rf["expression"], rf.get("description", "")
+            )
+            rf_expr_ids[rf["name"]] = created["id"]
+            print(f"[row_filter_expression] {rf['name']}: created (id={created['id']})")
+
+    for rf in config.get("row_filters", []):
+        role_id = role_ids[rf["role"]]
+        expr_id = rf_expr_ids[rf["name"]]
+        if client.row_filter_attached(role_id, rf["entity"], expr_id):
+            print(f"[row_filter] {rf['role']} -> {describe_entity(rf['entity'])}: exists, skipping")
+        else:
+            client.attach_row_filter(role_id, rf["entity"], expr_id)
+            print(f"[row_filter] {rf['role']} -> {describe_entity(rf['entity'])}: attached")
+
     for a in config.get("assignments", []):
         role_id = role_ids[a["role"]]
         for user in a.get("users", []):
@@ -506,6 +608,9 @@ def verify(client, config):
         for m in client.list_column_masks(role_id):
             print(f"    column_mask: {describe_entity(m.get('entity', {}))} "
                   f"(expressionId={m.get('expressionId')})")
+        for f in client.list_row_filters(role_id):
+            print(f"    row_filter: {describe_entity(f.get('entity', {}))} "
+                  f"(expressionId={f.get('expressionId')})")
 
 
 # --------------------------------------------------------------------------

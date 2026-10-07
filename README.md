@@ -1,8 +1,8 @@
 # starburst-biac-yaml-deploy
 
 Deploy Starburst SEP BIAC (Built-in Access Control) entitlements — roles,
-privilege grants, column masks, and role assignments — from a declarative
-YAML file, via the BIAC REST API.
+privilege grants, column masks, row filters, and role assignments — from a
+declarative YAML file, via the BIAC REST API.
 
 ## Structure
 
@@ -12,8 +12,16 @@ One folder per cluster/environment under `environments/`:
 environments/
   demo-lab/
     views.sql   # schema + view/table creation for this cluster
-    biac.yaml   # roles/grants/masks/assignments for this cluster
+    biac.yaml   # roles/grants/masks/filters/assignments for this cluster
+  staging/
+    views.sql
+    perimeter-perimetre.sql  # extra SQL file: RLS perimeter mapping table
+    biac.yaml
 ```
+
+An environment folder isn't limited to exactly `views.sql` + `biac.yaml` —
+add further `.sql` files for any extra schema/table that `biac.yaml`'s
+grants/row_filters reference, as staging does above.
 
 Catalog/schema/table names are hardcoded in each environment's files — there
 is no cross-environment templating. To reproduce a policy on a new cluster,
@@ -30,10 +38,15 @@ cp -r environments/demo-lab environments/acme-prod
 - ✅ Roles
 - ✅ Grants (privileges on tables/functions)
 - ✅ Column masks (CLS)
+- ✅ Row filters (RLS)
 - ✅ Assignments (user/group → role)
-- ❌ Row filters (RLS) — not supported in this version, add later if needed
 - ❌ Drift detection / pruning of entitlements not in the YAML — never
   deletes or revokes anything
+- ❌ In-place update of an existing grant/mask/filter's `effect` or
+  `expression` — the BIAC API rejects a duplicate create for the same
+  action+entity regardless of effect (409 ALREADY_EXISTS), so changing one
+  means deleting it on the cluster first, outside this tool, then re-running
+  `--apply`
 
 ## Requirements
 
@@ -107,6 +120,17 @@ column_masks:
       table: <table>
       columns: [<column>]
 
+row_filters:
+  - name: <expression name, unique>
+    description: <free text>
+    expression: <SQL boolean expression, e.g. a column IN (subquery)>
+    role: <role name declared above>
+    entity:
+      category: TABLES
+      catalog: <catalog>
+      schema: <schema>
+      table: <table>   # required — a row filter always targets one table
+
 assignments:
   - role: <role name declared above>
     users: [<username>, ...]
@@ -152,8 +176,9 @@ columns), so `table` is required there regardless.
 
 ## Known limitation
 
-Row filters (RLS) are not implemented in this version. The config
-validator will reject a `row_filters` section explicitly rather than
-silently ignoring it. See the header comment in
-`environments/demo-lab/biac.yaml` for the row filter expression to apply
-manually.
+This tool can only CREATE grants/masks/filters that don't already exist —
+it cannot change the `effect` or `expression` of one that's already on the
+cluster (the BIAC API treats a grant as the same object once action+entity
+match, regardless of effect, and rejects a second create with 409
+ALREADY_EXISTS). To change one, delete it directly via the BIAC API first
+(outside this tool), then re-run `--apply` to recreate it from the YAML.
