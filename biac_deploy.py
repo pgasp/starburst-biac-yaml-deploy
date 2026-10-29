@@ -27,9 +27,24 @@ Design:
   (409 ALREADY_EXISTS, keyed on action+entity, ignoring effect). To change
   an existing one, delete it on the cluster first (outside this tool), then
   re-run --apply.
-- allEntities:true is never emitted — every entity is fully scoped
-  (catalog/schema/table or catalog/schema/function), matching the BIAC API
-  constraint that allEntities:true forbids any other attribute.
+- allEntities:true is never emitted for data entities — TABLES/FUNCTIONS
+  are always scoped (catalog, catalog+schema, or catalog+schema+table/
+  function), matching the BIAC API constraint that allEntities:true forbids
+  any other attribute. Sole exception: AI_MODELS, where allEntities:true
+  ("all AI models") is what the SEP UI itself emits.
+
+Supported entity categories (grants):
+  TABLES         {category: TABLES, catalog, [schema], [table]}
+  FUNCTIONS      {category: FUNCTIONS, catalog, [schema], [function]}
+  DATA_PRODUCTS  {category: DATA_PRODUCTS, domainName, [dataProductName]}
+                 (domainName alone = every data product of the domain)
+  AI_MODELS      {category: AI_MODELS, allEntities: true}
+  USER_INTERFACE {category: USER_INTERFACE, uiFeature}
+                 (e.g. AI_MODELS, DATA_PRODUCTS, QUERY_EDITOR, CATALOG_EXPLORER)
+Formats read back from the BIAC API on the lab lab (2026-10-15).
+Column masks and row filters only accept TABLES.
+Location grants (top-level 'location_grants': role, location, grant_option)
+use their own endpoint /api/v1/biac/roles/{id}/locationGrants.
 """
 import argparse
 import base64
@@ -47,6 +62,15 @@ except ImportError:
     sys.exit(1)
 
 ROLE_NAME_RE = re.compile(r"^[a-z0-9_]+$")
+
+# Non-data entity categories and the attributes each accepts besides
+# category/allEntities (formats read back from the BIAC API, 2026-10-15).
+NON_DATA_CATEGORIES_KEYS = {
+    "DATA_PRODUCTS": ("domainName", "dataProductName"),
+    "AI_MODELS": (),
+    "USER_INTERFACE": ("uiFeature",),
+}
+NON_DATA_CATEGORIES = tuple(NON_DATA_CATEGORIES_KEYS)
 
 
 # --------------------------------------------------------------------------
@@ -104,7 +128,7 @@ def validate_config(config):
     errors = []
     warnings = []
 
-    known_top_level = {"roles", "grants", "column_masks", "row_filters", "assignments"}
+    known_top_level = {"roles", "grants", "location_grants", "column_masks", "row_filters", "assignments"}
     unknown = set(config.keys()) - known_top_level
     if unknown:
         errors.append(f"unknown top-level key(s): {sorted(unknown)}")
@@ -116,7 +140,11 @@ def validate_config(config):
             errors.append(f"invalid role name: {name!r} (must match ^[a-z0-9_]+$)")
         role_names.add(name)
 
-    def check_entity(entity, context):
+    def check_entity(entity, context, tables_only=False):
+        category = entity.get("category")
+        if not tables_only and category in NON_DATA_CATEGORIES:
+            check_non_data_entity(entity, context)
+            return
         if entity.get("allEntities") is True:
             errors.append(f"{context}: allEntities:true is forbidden by this tool "
                            f"— scope the entity explicitly (catalog, or catalog+schema, "
@@ -132,10 +160,10 @@ def validate_config(config):
             if entity.get(field) == "*":
                 errors.append(f"{context}: '*' is not a valid wildcard for '{field}' — "
                                f"omit '{field}' entirely instead for a catalog/schema-wide grant")
-        category = entity.get("category")
-        if category not in ("TABLES", "FUNCTIONS"):
+        allowed = ("TABLES",) if tables_only else ("TABLES", "FUNCTIONS") + NON_DATA_CATEGORIES
+        if category not in allowed:
             errors.append(f"{context}: unsupported or missing entity category {category!r} "
-                           f"(expected TABLES or FUNCTIONS)")
+                           f"(expected one of {', '.join(allowed)})")
             return
         if not entity.get("catalog"):
             errors.append(f"{context}: entity missing 'catalog'")
@@ -147,6 +175,30 @@ def validate_config(config):
         if entity.get(narrow_field) and not entity.get("schema"):
             errors.append(f"{context}: '{narrow_field}' given without 'schema' "
                            f"— a {narrow_field} always needs its schema specified")
+
+    def check_non_data_entity(entity, context):
+        category = entity["category"]
+        allowed_keys = {"category", "allEntities"} | set(NON_DATA_CATEGORIES_KEYS[category])
+        stray = set(entity.keys()) - allowed_keys
+        if stray:
+            errors.append(f"{context}: {category} entity does not accept {sorted(stray)} "
+                           f"(allowed: {sorted(allowed_keys)})")
+        if category == "AI_MODELS":
+            if entity.get("allEntities") is not True:
+                errors.append(f"{context}: AI_MODELS entity must set 'allEntities: true' "
+                               f"(per-model scoping is not supported by this tool)")
+            return
+        if entity.get("allEntities") is True:
+            errors.append(f"{context}: allEntities:true is forbidden for {category} "
+                           f"— scope it explicitly")
+        if category == "DATA_PRODUCTS":
+            if not entity.get("domainName"):
+                errors.append(f"{context}: DATA_PRODUCTS entity needs 'domainName' "
+                               f"(add 'dataProductName' to target a single data product)")
+            if entity.get("domainName") == "*" or entity.get("dataProductName") == "*":
+                errors.append(f"{context}: '*' is not a wildcard — omit 'dataProductName' instead")
+        if category == "USER_INTERFACE" and not entity.get("uiFeature"):
+            errors.append(f"{context}: USER_INTERFACE entity needs 'uiFeature'")
 
     known_grant_keys = {"role", "effect", "action", "entity"}
     for g in config.get("grants", []):
@@ -165,6 +217,20 @@ def validate_config(config):
         if not grant_actions(g):
             errors.append(f"grant on role {role!r}: missing 'action' (string or list of strings)")
         check_entity(g.get("entity", {}), f"grant on role {role!r}")
+
+    for lg in config.get("location_grants", []):
+        role = lg.get("role")
+        stray = set(lg.keys()) - {"role", "location", "grant_option"}
+        if stray:
+            errors.append(f"location_grant on role {role!r}: unknown key(s) {sorted(stray)}")
+        if role not in role_names:
+            errors.append(f"location_grant references undeclared role: {role!r}")
+        loc = lg.get("location")
+        if not isinstance(loc, str) or not re.match(r"^[a-z0-9]+://[^/]+/", loc):
+            errors.append(f"location_grant on role {role!r}: 'location' must be a full URI "
+                           f"with a bucket and a path (e.g. s3://bucket/prefix/*), got {loc!r}")
+        if not isinstance(lg.get("grant_option", False), bool):
+            errors.append(f"location_grant on role {role!r}: 'grant_option' must be true/false")
 
     known_mask_keys = {"name", "description", "expression", "role", "entity"}
     for m in config.get("column_masks", []):
@@ -186,7 +252,7 @@ def validate_config(config):
         if not entity.get("table"):
             errors.append(f"column_mask {m.get('name')!r}: entity must specify a 'table' "
                            f"— a column mask always targets one specific table, never catalog/schema-wide")
-        check_entity(entity, f"column_mask {m.get('name')!r}")
+        check_entity(entity, f"column_mask {m.get('name')!r}", tables_only=True)
 
     known_rf_keys = {"name", "description", "expression", "role", "entity"}
     for rf in config.get("row_filters", []):
@@ -209,7 +275,7 @@ def validate_config(config):
         if entity.get("columns"):
             errors.append(f"row_filter {rf.get('name')!r}: entity must not specify 'columns' "
                            f"— row filters apply to whole rows, not specific columns (did you mean column_masks?)")
-        check_entity(entity, f"row_filter {rf.get('name')!r}")
+        check_entity(entity, f"row_filter {rf.get('name')!r}", tables_only=True)
 
     for a in config.get("assignments", []):
         role = a.get("role")
@@ -295,6 +361,24 @@ class BiacClient:
         status, resp = self.call("POST", f"/api/v1/biac/roles/{role_id}/grants", body)
         if status not in (200, 201):
             raise RuntimeError(f"POST /roles/{role_id}/grants failed: {status} {resp}")
+        return resp
+
+    # --- location grants (separate endpoint from entity grants) ---
+    def list_location_grants(self, role_id):
+        status, body = self.call("GET", f"/api/v1/biac/roles/{role_id}/locationGrants")
+        if status != 200:
+            raise RuntimeError(f"GET /roles/{role_id}/locationGrants failed: {status} {body}")
+        return body["result"]
+
+    def location_grant_exists(self, role_id, location, grant_option):
+        return any(g.get("location") == location and bool(g.get("grantOption")) == grant_option
+                   for g in self.list_location_grants(role_id))
+
+    def create_location_grant(self, role_id, location, grant_option):
+        body = {"location": location, "grantOption": grant_option}
+        status, resp = self.call("POST", f"/api/v1/biac/roles/{role_id}/locationGrants", body)
+        if status not in (200, 201):
+            raise RuntimeError(f"POST /roles/{role_id}/locationGrants failed: {status} {resp}")
         return resp
 
     # --- column mask expressions ---
@@ -415,7 +499,10 @@ def _norm(v):
 
 
 def entities_equal(a, b):
-    keys = {"category", "catalog", "schema", "table", "function"}
+    keys = {"category", "catalog", "schema", "table", "function",
+            "domainName", "dataProductName", "uiFeature"}
+    if bool(a.get("allEntities")) != bool(b.get("allEntities")):
+        return False
     a_cols = sorted(_norm(c) for c in (a.get("columns") or []))
     b_cols = sorted(_norm(c) for c in (b.get("columns") or []))
     return (all(_norm(a.get(k)) == _norm(b.get(k)) for k in keys) and a_cols == b_cols)
@@ -456,6 +543,15 @@ def plan(client, config):
                 actions.append(("grant", label, "SKIP (exists)"))
             else:
                 actions.append(("grant", label, "CREATE"))
+
+    for lg in config.get("location_grants", []):
+        role_id = role_ids.get(lg["role"])
+        go = lg.get("grant_option", False)
+        label = f"{lg['role']} -> location {lg['location']}" + (" (with grant option)" if go else "")
+        if role_id and client.location_grant_exists(role_id, lg["location"], go):
+            actions.append(("location_grant", label, "SKIP (exists)"))
+        else:
+            actions.append(("location_grant", label, "CREATE"))
 
     for m in config.get("column_masks", []):
         role_id = role_ids.get(m["role"])
@@ -501,6 +597,15 @@ def plan(client, config):
 
 
 def describe_entity(entity):
+    category = entity.get("category")
+    if category == "AI_MODELS":
+        return "AI_MODELS:*" if entity.get("allEntities") else f"AI_MODELS:{entity.get('entityKey', '?')}"
+    if category == "USER_INTERFACE":
+        return f"UI:{entity.get('uiFeature')}"
+    if category == "DATA_PRODUCTS":
+        if entity.get("allEntities"):
+            return "DATA_PRODUCTS:*"
+        return f"DATA_PRODUCTS:{entity.get('domainName')}.{entity.get('dataProductName') or '*'}"
     narrow_field = "function" if entity.get("category") == "FUNCTIONS" else "table"
     parts = [entity.get("catalog"), entity.get("schema"), entity.get(narrow_field)]
     parts = [p for p in parts if p]  # catalog-only or catalog+schema grants omit the rest
@@ -545,6 +650,15 @@ def apply(client, config):
                 client.create_grant(role_id, g["effect"], action, g["entity"])
                 print(f"[grant] {g['role']} {g['effect']} {action} "
                       f"{describe_entity(g['entity'])}: created")
+
+    for lg in config.get("location_grants", []):
+        role_id = role_ids[lg["role"]]
+        go = lg.get("grant_option", False)
+        if client.location_grant_exists(role_id, lg["location"], go):
+            print(f"[location_grant] {lg['role']} {lg['location']}: exists, skipping")
+        else:
+            client.create_location_grant(role_id, lg["location"], go)
+            print(f"[location_grant] {lg['role']} {lg['location']}: created")
 
     for m in config.get("column_masks", []):
         role_id = role_ids[m["role"]]
@@ -604,7 +718,9 @@ def verify(client, config):
         print(f"[role] {r['name']} (id={role_id})")
         for g in client.list_grants(role_id):
             print(f"    grant: {g.get('effect')} {g.get('action')} "
-                  f"{describe_entity(g.get('entity', {}))}")
+                  f"{describe_entity(g.get('entity', {}))}  {json.dumps(g.get('entity', {}), sort_keys=True)}")
+        for lg in client.list_location_grants(role_id):
+            print(f"    location_grant: {lg.get('location')} (grantOption={lg.get('grantOption')})")
         for m in client.list_column_masks(role_id):
             print(f"    column_mask: {describe_entity(m.get('entity', {}))} "
                   f"(expressionId={m.get('expressionId')})")

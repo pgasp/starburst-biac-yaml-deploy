@@ -36,7 +36,8 @@ cp -r environments/demo-lab environments/acme-prod
 ## Scope (v1)
 
 - ✅ Roles
-- ✅ Grants (privileges on tables/functions)
+- ✅ Grants (tables/functions, data products, AI models, UI features)
+- ✅ Location grants (`location_grants`, endpoint séparé `/locationGrants`)
 - ✅ Column masks (CLS)
 - ✅ Row filters (RLS)
 - ✅ Assignments (user/group → role)
@@ -147,6 +148,15 @@ one table, by **omitting** the narrower field(s) — not by setting them to
 ```yaml
 entity: {category: TABLES, catalog: datahub}                  # catalog.*
 entity: {category: TABLES, catalog: datahub, schema: my_schema} # catalog.schema.*
+```
+
+Non-data entities (grants only — masks and row filters accept TABLES only):
+
+```yaml
+entity: {category: DATA_PRODUCTS, domainName: CIB}                          # every DP of domain CIB
+entity: {category: DATA_PRODUCTS, domainName: CIB, dataProductName: my_dp}  # one DP
+entity: {category: AI_MODELS, allEntities: true}                            # all AI models (only allowed form)
+entity: {category: USER_INTERFACE, uiFeature: AI_MODELS}                    # UI feature (QUERY_EDITOR, DATA_PRODUCTS…)
 ```
 
 A column mask always targets one specific table (it masks specific
