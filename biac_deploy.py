@@ -7,6 +7,12 @@ Usage:
     python3 biac_deploy.py --env .env.lab --config environments/demo-lab/biac.yaml --dry-run
     python3 biac_deploy.py --env .env.lab --config environments/demo-lab/biac.yaml --apply
     python3 biac_deploy.py --env .env.lab --config environments/demo-lab/biac.yaml --verify
+    python3 biac_deploy.py --config environments/demo-lab/biac.yaml --validate   # offline, no env, no network
+
+Reviewed (signed) plan, no interactive prompt — the plan that was shown and
+validated is the only one that can be applied:
+    python3 biac_deploy.py --env .env.lab --config f.biac.yaml --dry-run --plan-out plan.json
+    python3 biac_deploy.py --env .env.lab --config f.biac.yaml --apply --plan plan.json
 
 Each cluster/environment gets its own folder under environments/<name>/,
 containing its biac.yaml (real catalog/schema/table names for that cluster)
@@ -48,9 +54,12 @@ use their own endpoint /api/v1/biac/roles/{id}/locationGrants.
 """
 import argparse
 import base64
+import hashlib
 import json
+import os
 import re
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -62,6 +71,17 @@ except ImportError:
     sys.exit(1)
 
 ROLE_NAME_RE = re.compile(r"^[a-z0-9_]+$")
+
+# Guardrails (fail closed): these roles can never be the target of a grant,
+# location grant, column mask, row filter or assignment, nor be declared.
+FORBIDDEN_ROLES = frozenset({"sysadmin", "public"})
+# Effects that widen access; on a whole catalog they need an explicit opt-in
+# through the root key 'allow_catalog_wide'.
+WIDENING_EFFECTS = frozenset({"ALLOW", "ALLOW_WITH_GRANT_OPTION"})
+
+PLAN_FILE_VERSION = 1
+EXIT_VALIDATION = 2   # invalid YAML / guardrail violation / bad CLI usage
+EXIT_PLAN_REFUSED = 3  # --apply --plan: signed plan does not match
 
 # Non-data entity categories and the attributes each accepts besides
 # category/allEntities (formats read back from the BIAC API, 2026-10-15).
@@ -92,11 +112,21 @@ def load_env(path):
     return env
 
 
-def load_config(path):
-    with open(path) as f:
-        config = yaml.safe_load(f) or {}
+def read_config_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def parse_config(raw):
+    config = yaml.safe_load(raw) or {}
+    if not isinstance(config, dict):
+        raise ValueError("Config validation failed:\n  - the YAML root must be a mapping")
     validate_config(config)
     return config
+
+
+def load_config(path):
+    return parse_config(read_config_bytes(path))
 
 
 MAX_DESCRIPTION_LENGTH = 250  # BIAC API limit, confirmed by testing against a real cluster
@@ -128,10 +158,32 @@ def validate_config(config):
     errors = []
     warnings = []
 
-    known_top_level = {"roles", "grants", "location_grants", "column_masks", "row_filters", "assignments"}
+    known_top_level = {"roles", "grants", "location_grants", "column_masks", "row_filters", "assignments",
+                       "allow_catalog_wide", "allowed_users", "allowed_groups"}
     unknown = set(config.keys()) - known_top_level
     if unknown:
         errors.append(f"unknown top-level key(s): {sorted(unknown)}")
+
+    def declared_names(key):
+        """Root guardrail lists: must be a list of non-empty strings. A
+        missing key means an empty list (fail closed)."""
+        value = config.get(key)
+        if value is None:
+            return set()
+        if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+            errors.append(f"'{key}' must be a list of non-empty strings")
+            return set()
+        return set(value)
+
+    allow_catalog_wide = {c.lower() for c in declared_names("allow_catalog_wide")}
+    allowed_users = declared_names("allowed_users")
+    allowed_groups = declared_names("allowed_groups")
+
+    def check_role_not_forbidden(role, context):
+        if isinstance(role, str) and role.lower() in FORBIDDEN_ROLES:
+            errors.append(f"{context}: role {role!r} is forbidden by this tool "
+                           f"(never grant, mask, filter or assign anything on "
+                           f"{' / '.join(sorted(FORBIDDEN_ROLES))})")
 
     role_names = set()
     for r in config.get("roles", []):
@@ -139,6 +191,7 @@ def validate_config(config):
         if not name or not ROLE_NAME_RE.match(name):
             errors.append(f"invalid role name: {name!r} (must match ^[a-z0-9_]+$)")
         role_names.add(name)
+        check_role_not_forbidden(name, "role declaration")
 
     def check_entity(entity, context, tables_only=False):
         category = entity.get("category")
@@ -216,7 +269,17 @@ def validate_config(config):
             errors.append(f"grant on role {role!r}: invalid or missing 'effect'")
         if not grant_actions(g):
             errors.append(f"grant on role {role!r}: missing 'action' (string or list of strings)")
-        check_entity(g.get("entity", {}), f"grant on role {role!r}")
+        check_role_not_forbidden(role, f"grant on role {role!r}")
+        entity = g.get("entity", {})
+        check_entity(entity, f"grant on role {role!r}")
+        if (g.get("effect") in WIDENING_EFFECTS
+                and entity.get("category") in ("TABLES", "FUNCTIONS")
+                and entity.get("catalog") and not entity.get("schema")
+                and str(entity["catalog"]).lower() not in allow_catalog_wide):
+            errors.append(f"grant on role {role!r}: {g.get('effect')} on the whole catalog "
+                           f"{entity['catalog']!r} (no schema) requires an explicit opt-in — add "
+                           f"'allow_catalog_wide: [{entity['catalog']}]' at the root of the file, "
+                           f"or scope the grant to a schema")
 
     for lg in config.get("location_grants", []):
         role = lg.get("role")
@@ -225,6 +288,7 @@ def validate_config(config):
             errors.append(f"location_grant on role {role!r}: unknown key(s) {sorted(stray)}")
         if role not in role_names:
             errors.append(f"location_grant references undeclared role: {role!r}")
+        check_role_not_forbidden(role, f"location_grant on role {role!r}")
         loc = lg.get("location")
         if not isinstance(loc, str) or not re.match(r"^[a-z0-9]+://[^/]+/", loc):
             errors.append(f"location_grant on role {role!r}: 'location' must be a full URI "
@@ -235,6 +299,7 @@ def validate_config(config):
     known_mask_keys = {"name", "description", "expression", "role", "entity"}
     for m in config.get("column_masks", []):
         role = m.get("role")
+        check_role_not_forbidden(role, f"column_mask {m.get('name')!r}")
         unknown_keys = set(m.keys()) - known_mask_keys
         if unknown_keys:
             errors.append(f"column_mask {m.get('name')!r}: unknown key(s) {sorted(unknown_keys)}")
@@ -257,6 +322,7 @@ def validate_config(config):
     known_rf_keys = {"name", "description", "expression", "role", "entity"}
     for rf in config.get("row_filters", []):
         role = rf.get("role")
+        check_role_not_forbidden(role, f"row_filter {rf.get('name')!r}")
         unknown_keys = set(rf.keys()) - known_rf_keys
         if unknown_keys:
             errors.append(f"row_filter {rf.get('name')!r}: unknown key(s) {sorted(unknown_keys)}")
@@ -279,8 +345,19 @@ def validate_config(config):
 
     for a in config.get("assignments", []):
         role = a.get("role")
+        check_role_not_forbidden(role, "assignment")
         if role not in role_names:
             errors.append(f"assignment references undeclared role: {role!r}")
+        for key, allowed, declared_key in (("users", allowed_users, "allowed_users"),
+                                           ("groups", allowed_groups, "allowed_groups")):
+            listed = a.get(key) or []
+            if not isinstance(listed, list) or not all(isinstance(x, str) and x for x in listed):
+                errors.append(f"assignment on role {role!r}: '{key}' must be a list of non-empty strings")
+                continue
+            for name in listed:
+                if name not in allowed:
+                    errors.append(f"assignment on role {role!r}: {key[:-1]} {name!r} is not declared in "
+                                   f"the root '{declared_key}' list of this file (fail closed)")
         if not a.get("users") and not a.get("groups"):
             warnings.append(f"assignment on role {role!r}: no users or groups listed "
                              f"(nothing to do here — check this isn't a mistake)")
@@ -305,6 +382,9 @@ class BiacClient:
         self.auth = base64.b64encode(
             f"{env['SB_USER']}:{env['SB_PASSWORD']}".encode()
         ).decode()
+
+    def __repr__(self):  # never expose the Authorization material
+        return f"BiacClient({self.host}:{self.port})"
 
     def call(self, method, path, body=None):
         data = json.dumps(body).encode() if body is not None else None
@@ -730,49 +810,236 @@ def verify(client, config):
 
 
 # --------------------------------------------------------------------------
+# Signed plan: --dry-run --plan-out F  /  --apply --plan F
+# --------------------------------------------------------------------------
+
+def plan_records(actions):
+    """Plan tuples -> JSON-friendly records (stable order = plan order)."""
+    return [{"kind": k, "label": label, "action": a} for k, label, a in actions]
+
+
+def canonical_json(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def sha256_hex(data):
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def plan_fingerprint(records, config_sha256, cluster):
+    """SHA-256 over the canonical plan, the exact bytes of the YAML file and
+    the target cluster. Any change to one of the three changes the fingerprint."""
+    return sha256_hex(canonical_json({"cluster": cluster, "config_sha256": config_sha256, "plan": records}))
+
+
+def build_signed_plan(actions, config_bytes, cluster):
+    records = plan_records(actions)
+    config_sha = sha256_hex(config_bytes)
+    return {
+        "version": PLAN_FILE_VERSION,
+        "cluster": cluster,
+        "config_sha256": config_sha,
+        "plan": records,
+        "fingerprint": plan_fingerprint(records, config_sha, cluster),
+    }
+
+
+def write_plan_file(path, signed_plan):
+    """Atomic write, mode 0600 (the plan holds no credential, but there is no
+    reason for it to be world-readable)."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".plan-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(signed_plan, f, indent=2, sort_keys=True, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def load_plan_file(path):
+    with open(path) as f:
+        data = json.load(f)
+    required = {"version", "cluster", "config_sha256", "plan", "fingerprint"}
+    if not isinstance(data, dict) or not required <= set(data) or data["version"] != PLAN_FILE_VERSION:
+        raise ValueError(f"{path}: not a valid plan file (version {PLAN_FILE_VERSION})")
+    if not isinstance(data["plan"], list):
+        raise ValueError(f"{path}: not a valid plan file ('plan' must be a list)")
+    return data
+
+
+def plan_diff_lines(old_records, new_records):
+    old = {canonical_json(r) for r in old_records}
+    new = {canonical_json(r) for r in new_records}
+    lines = [f"  - only in the signed plan: [{json.loads(r)['kind']}] {json.loads(r)['label']}: {json.loads(r)['action']}"
+             for r in sorted(old - new)]
+    lines += [f"  + only in the recomputed plan: [{json.loads(r)['kind']}] {json.loads(r)['label']}: {json.loads(r)['action']}"
+              for r in sorted(new - old)]
+    return lines
+
+
+def check_signed_plan(signed, live_actions, config_bytes, cluster):
+    """Returns a list of refusal reasons (empty = the signed plan is valid)."""
+    reasons = []
+    stored_records = signed["plan"]
+    if plan_fingerprint(stored_records, signed["config_sha256"], signed["cluster"]) != signed["fingerprint"]:
+        reasons.append("the plan file was altered (its fingerprint does not match its own content)")
+    if signed["cluster"] != cluster:
+        reasons.append(f"the plan was made for cluster {signed['cluster']!r}, not {cluster!r}")
+    if signed["config_sha256"] != sha256_hex(config_bytes):
+        reasons.append("the YAML file changed since the plan was signed")
+    live_records = plan_records(live_actions)
+    live_fp = plan_fingerprint(live_records, sha256_hex(config_bytes), cluster)
+    if live_fp != signed["fingerprint"]:
+        reasons.append("the recomputed plan differs from the signed plan (cluster state or YAML changed)")
+        reasons.extend(plan_diff_lines(stored_records, live_records))
+    return reasons
+
+
+def print_plan(actions, title):
+    print(title)
+    for kind, label, action in actions:
+        print(f"[{kind}] {label}: {action}")
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--env", required=True, help="Path to .env file (SB_HOST/SB_PORT/SB_USER/SB_PASSWORD)")
+def redact(text, env, limit=None):
+    """Strip credential material from any text about to be printed."""
+    text = str(text)
+    for secret in (env.get("SB_PASSWORD"),
+                   base64.b64encode(f"{env.get('SB_USER')}:{env.get('SB_PASSWORD')}".encode()).decode()
+                   if env.get("SB_PASSWORD") else None):
+        if secret:
+            text = text.replace(secret, "****")
+    return text if limit is None else text[:limit]
+
+
+def build_parser():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--env", help="Path to .env file (SB_HOST/SB_PORT/SB_USER/SB_PASSWORD); "
+                                 "required except with --validate")
     p.add_argument("--config", required=True, help="Path to environments/<name>/biac.yaml")
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true", help="Print the plan, no writes")
     mode.add_argument("--apply", action="store_true", help="Execute the plan")
     mode.add_argument("--verify", action="store_true", help="Read back and print current state")
-    args = p.parse_args()
+    mode.add_argument("--validate", action="store_true",
+                      help="Offline: run the validator (guardrails included) on --config only; "
+                           "no env file, no network")
+    p.add_argument("--plan-out", metavar="FILE",
+                   help="With --dry-run: write the plan and its SHA-256 fingerprint to FILE (JSON)")
+    p.add_argument("--plan", metavar="FILE",
+                   help="With --apply: apply only if the recomputed plan matches FILE "
+                        "(no interactive prompt; refuses with exit code 3 otherwise)")
+    return p
+
+
+def run(args, secrets):
+    """Returns the process exit code. Raises on errors (handled by main).
+    `secrets` receives the loaded env so main can redact error messages."""
+    if args.validate:
+        parse_config(read_config_bytes(args.config))
+        print(f"OK: {args.config} passes validation (offline, no network).")
+        return 0
 
     env = load_env(args.env)
+    secrets.update(env)
     print(f"Cluster: {env['SB_HOST']}:{env['SB_PORT']}  User: {env['SB_USER']}  Password: ****")
 
-    config = load_config(args.config)
+    config_bytes = read_config_bytes(args.config)
+    config = parse_config(config_bytes)
     client = BiacClient(env)
+    cluster = f"{env['SB_HOST']}:{env['SB_PORT']}"
 
     if args.dry_run:
-        print("=== Plan (dry-run, no changes made) ===")
-        for kind, label, action in plan(client, config):
-            print(f"[{kind}] {label}: {action}")
-    elif args.apply:
         actions = plan(client, config)
-        print("=== Plan ===")
-        for kind, label, action in actions:
-            print(f"[{kind}] {label}: {action}")
+        print_plan(actions, "=== Plan (dry-run, no changes made) ===")
+        if args.plan_out:
+            signed = build_signed_plan(actions, config_bytes, cluster)
+            write_plan_file(args.plan_out, signed)
+            print(f"\nPlan written to {args.plan_out}")
+            print(f"Fingerprint (SHA-256): {signed['fingerprint']}")
+        return 0
+
+    if args.apply:
+        actions = plan(client, config)
+        if args.plan:
+            signed = load_plan_file(args.plan)
+            reasons = check_signed_plan(signed, actions, config_bytes, cluster)
+            if reasons:
+                print("REFUSED: the signed plan does not match — nothing was applied.", file=sys.stderr)
+                for r in reasons:
+                    print(r if r.startswith("  ") else f"  * {r}", file=sys.stderr)
+                print("Re-run --dry-run --plan-out and have the new plan validated.", file=sys.stderr)
+                return EXIT_PLAN_REFUSED
+            print_plan(actions, f"=== Plan (matches signed plan {signed['fingerprint'][:12]}…) ===")
+            if not any(a[2] == "CREATE" for a in actions):
+                print("\nNothing to do — cluster state already matches config.")
+                return 0
+            print("\n=== Applying (signed plan, no prompt) ===")
+            apply(client, config)
+            return 0
+
+        print_plan(actions, "=== Plan ===")
         broadening = [a for a in actions if a[2] == "CREATE"]
         if broadening:
             print(f"\n{len(broadening)} new entitlement object(s) will be created (see plan above).")
             confirm = input("Type 'yes' to proceed: ")
             if confirm.strip().lower() != "yes":
                 print("Aborted.")
-                sys.exit(1)
+                return 1
         else:
             print("\nNothing to do — cluster state already matches config.")
-            return
+            return 0
         print("\n=== Applying ===")
         apply(client, config)
-    elif args.verify:
-        verify(client, config)
+        return 0
+
+    verify(client, config)
+    return 0
+
+
+def main(argv=None):
+    p = build_parser()
+    args = p.parse_args(argv)
+    if not args.validate and not args.env:
+        p.error("--env is required (except with --validate)")
+    if args.plan_out and not args.dry_run:
+        p.error("--plan-out is only valid with --dry-run")
+    if args.plan and not args.apply:
+        p.error("--plan is only valid with --apply")
+    secrets = {}
+    try:
+        return run(args, secrets)
+    except (ValueError, yaml.YAMLError) as e:  # config / plan file validation (JSONDecodeError is a ValueError)
+        print(redact(e, secrets), file=sys.stderr)
+        return EXIT_VALIDATION
+    except urllib.error.URLError as e:
+        print(f"ERROR (network): {redact(getattr(e, 'reason', e), secrets, 500)}", file=sys.stderr)
+        return 1
+    except (OSError, RuntimeError) as e:
+        # Short message only: no traceback (a traceback or an HTTP error can
+        # carry request headers / response bodies).
+        print(f"ERROR ({type(e).__name__}): {redact(e, secrets, 500)}", file=sys.stderr)
+        return 1
+    except EOFError:
+        print("Aborted (no interactive input).", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        return 130
+    except Exception as e:  # last resort: never a raw traceback (could expose request data)
+        print(f"ERROR ({type(e).__name__}): {redact(e, secrets, 500)}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
