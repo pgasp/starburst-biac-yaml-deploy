@@ -36,6 +36,7 @@ class FakeClient:
         self.assign = set()  # (kind, subject, role_id)
         self.writes = 0
         self.mask_expr, self.rf_expr = {}, {}
+        self.mask_text, self.rf_text = {}, {}  # name -> expression text
         self.mask_att, self.rf_att, self.loc = set(), set(), set()
 
     def __repr__(self):
@@ -67,11 +68,13 @@ class FakeClient:
 
     # expressions / masks / filters
     def find_column_mask_expression(self, name):
-        return {"id": self.mask_expr[name]} if name in self.mask_expr else None
+        return ({"id": self.mask_expr[name], "name": name, "expression": self.mask_text[name]}
+                if name in self.mask_expr else None)
 
     def create_column_mask_expression(self, name, expression, description):
         self.writes += 1
         self.mask_expr[name] = 100 + len(self.mask_expr)
+        self.mask_text[name] = expression
         return {"id": self.mask_expr[name]}
 
     def column_mask_attached(self, role_id, entity, expr_id):
@@ -82,11 +85,13 @@ class FakeClient:
         self.mask_att.add((role_id, json.dumps(entity, sort_keys=True), expr_id))
 
     def find_row_filter_expression(self, name):
-        return {"id": self.rf_expr[name]} if name in self.rf_expr else None
+        return ({"id": self.rf_expr[name], "name": name, "expression": self.rf_text[name]}
+                if name in self.rf_expr else None)
 
     def create_row_filter_expression(self, name, expression, description):
         self.writes += 1
         self.rf_expr[name] = 200 + len(self.rf_expr)
+        self.rf_text[name] = expression
         return {"id": self.rf_expr[name]}
 
     def row_filter_attached(self, role_id, entity, expr_id):
@@ -360,6 +365,118 @@ class SignedPlanFlowTests(WorkDir):
             self.assertEqual(bd.main(["--config", self.cfg, "--validate"]), 0)
 
 
+EXPR_YAML = """\
+roles:
+  - name: zz_test_reader
+column_masks:
+  - name: zz_mask
+    expression: "'****'"
+    role: zz_test_reader
+    entity: {category: TABLES, catalog: tpch, schema: tiny, table: nation, columns: [comment]}
+row_filters:
+  - name: zz_filter
+    expression: "regionkey IN (SELECT perimetre FROM postgres.perimeter.perimeter_perimetre WHERE upn=current_user)"
+    role: zz_test_reader
+    entity: {category: TABLES, catalog: tpch, schema: tiny, table: nation}
+"""
+
+
+class DriftTests(WorkDir):
+    def setUp(self):
+        super().setUp()
+        self.cfg = self.write("t.biac.yaml", EXPR_YAML)
+        self.env = self.env_file()
+        self.plan_path = self.path("plan.json")
+
+    def dry(self, client):
+        return self.run_main(["--env", self.env, "--config", self.cfg, "--dry-run",
+                              "--plan-out", self.plan_path], client)
+
+    def apply_signed(self, client):
+        return self.run_main(["--env", self.env, "--config", self.cfg, "--apply",
+                              "--plan", self.plan_path], client)
+
+    def seeded(self, rf_text=None, mask_text=None):
+        c = FakeClient()
+        self.dry(c)
+        self.apply_signed(c)  # create everything with the YAML text
+        if rf_text is not None:
+            c.rf_text["zz_filter"] = rf_text
+        if mask_text is not None:
+            c.mask_text["zz_mask"] = mask_text
+        c.writes = 0
+        return c
+
+    def actions(self, kind):
+        return [(r["label"], r["action"]) for r in read_json(self.plan_path)["plan"] if r["kind"] == kind]
+
+    def test_identical_text_is_skip(self):
+        c = self.seeded()
+        self.dry(c)
+        self.assertEqual({a for _, a in self.actions("row_filter_expression")}, {"SKIP (exists)"})
+        self.assertEqual({a for _, a in self.actions("column_mask_expression")}, {"SKIP (exists)"})
+
+    def test_whitespace_only_difference_is_skip(self):
+        c = self.seeded(rf_text="regionkey   IN (SELECT perimetre FROM postgres.perimeter.perimeter_perimetre\n"
+                                "  WHERE upn=current_user) ")
+        self.dry(c)
+        self.assertEqual({a for _, a in self.actions("row_filter_expression")}, {"SKIP (exists)"})
+
+    def test_row_filter_text_difference_is_drift_with_both_texts(self):
+        c = self.seeded(rf_text="regionkey IN (SELECT perimetre FROM iceberg.acme_parameter.perimeter WHERE upn=current_user)")
+        rc, out, err = self.dry(c)
+        self.assertEqual(rc, 0)
+        (label, action), = self.actions("row_filter_expression")
+        self.assertEqual(action, bd.DRIFT_ACTION)
+        self.assertIn("zz_filter", label)
+        self.assertIn("iceberg.acme_parameter.perimeter", label)
+        self.assertIn("postgres.perimeter.perimeter_perimetre", label)
+        self.assertIn("DRIFT", err)  # warning on stderr, plan still written
+        self.assertEqual(c.writes, 0)
+
+    def test_column_mask_text_difference_is_drift(self):
+        c = self.seeded(mask_text="'XXXX'")
+        self.dry(c)
+        (label, action), = self.actions("column_mask_expression")
+        self.assertEqual(action, bd.DRIFT_ACTION)
+        self.assertIn("'XXXX'", label)
+        self.assertIn("'****'", label)
+
+    def test_apply_refuses_on_row_filter_drift_even_with_matching_signed_plan(self):
+        c = self.seeded(rf_text="other_col IN (1)")
+        self.dry(c)  # signed plan that contains the DRIFT
+        rc, _, err = self.apply_signed(c)
+        self.assertEqual(rc, bd.EXIT_DRIFT)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("DRIFT", err)
+        self.assertEqual(c.writes, 0)
+
+    def test_apply_refuses_on_column_mask_drift(self):
+        c = self.seeded(mask_text="'XXXX'")
+        self.dry(c)
+        rc, _, _ = self.apply_signed(c)
+        self.assertEqual(rc, bd.EXIT_DRIFT)
+        self.assertEqual(c.writes, 0)
+
+    def test_manual_apply_refuses_on_drift_without_prompt(self):
+        c = self.seeded(rf_text="other_col IN (1)")
+        rc, _, _ = self.run_main(["--env", self.env, "--config", self.cfg, "--apply"], c)
+        self.assertEqual(rc, bd.EXIT_DRIFT)
+        self.assertEqual(c.writes, 0)
+
+    def test_apply_function_itself_refuses_drift(self):
+        c = self.seeded(rf_text="other_col IN (1)")
+        with self.assertRaises(RuntimeError):
+            bd.apply(c, validate(EXPR_YAML))
+        self.assertEqual(c.writes, 0)
+
+    def test_new_expression_is_still_create(self):
+        c = FakeClient()
+        self.dry(c)
+        self.assertEqual({a for _, a in self.actions("row_filter_expression")}, {"CREATE"})
+        self.assertEqual({a for _, a in self.actions("column_mask_expression")}, {"CREATE"})
+
+
 class GuardrailTests(unittest.TestCase):
     def test_good_yaml_passes(self):
         validate(GOOD_YAML)
@@ -458,6 +575,37 @@ class GuardrailTests(unittest.TestCase):
 
     def test_unknown_root_key_still_refused(self):
         self.assertIn("unknown top-level", validation_errors("allowed_user: [demo]\n"))
+
+
+class ExpressionNameLengthTests(unittest.TestCase):
+    ENT = "{category: TABLES, catalog: tpch, schema: tiny, table: nation}"
+
+    def _mask(self, name):
+        return ("roles:\n  - name: zz_ok\ncolumn_masks:\n"
+                f"  - name: {name}\n    expression: \"'x'\"\n    role: zz_ok\n"
+                "    entity: {category: TABLES, catalog: tpch, schema: tiny, table: nation, columns: [name]}\n")
+
+    def _filter(self, name):
+        return ("roles:\n  - name: zz_ok\nrow_filters:\n"
+                f"  - name: {name}\n    expression: \"true\"\n    role: zz_ok\n    entity: {self.ENT}\n")
+
+    def test_names_of_exactly_30_chars_are_accepted(self):
+        name = "n" * 30
+        validate(self._mask(name))
+        validate(self._filter(name))
+
+    def test_column_mask_name_over_30_chars_is_refused(self):
+        name = "m" * 31
+        errors = validation_errors(self._mask(name))
+        self.assertIn(f"column_mask '{name}'", errors)
+        self.assertIn("31 chars", errors)
+        self.assertIn("30-char", errors)
+
+    def test_row_filter_name_over_30_chars_is_refused(self):
+        name = "datahub_orders_region_filter"  # 32 chars
+        errors = validation_errors(self._filter(name))
+        self.assertIn(f"row_filter '{name}'", errors)
+        self.assertIn(f"{len(name)} chars", errors)
 
 
 if __name__ == "__main__":

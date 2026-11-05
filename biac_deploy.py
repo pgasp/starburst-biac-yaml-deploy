@@ -26,7 +26,12 @@ Design:
 - Fail closed: config validation happens entirely before any network call.
   Any invalid or ambiguous entry aborts the whole run — nothing partial.
 - No implicit destructive action: this script never deletes or revokes
-  anything. Drift detection / pruning is explicitly out of scope for v1.
+  anything. Pruning is explicitly out of scope for v1. Drift detection is
+  limited to row-filter / column-mask expressions: an expression that exists
+  under the same name but with a different text (whitespace-normalised) is
+  planned as 'DRIFT (expression differs)' and --apply refuses (exit 4) while
+  the plan contains any DRIFT — it is never silently reused. Fix the YAML or
+  align the cluster (outside this tool), then re-plan.
   This also means an existing grant/row filter/column mask can never be
   changed in place (e.g. ALLOW -> ALLOW_WITH_GRANT_OPTION on the same
   entity) — the BIAC API itself rejects a duplicate create in that case
@@ -82,6 +87,8 @@ WIDENING_EFFECTS = frozenset({"ALLOW", "ALLOW_WITH_GRANT_OPTION"})
 PLAN_FILE_VERSION = 1
 EXIT_VALIDATION = 2   # invalid YAML / guardrail violation / bad CLI usage
 EXIT_PLAN_REFUSED = 3  # --apply --plan: signed plan does not match
+EXIT_DRIFT = 4         # --apply: an existing expression differs from the YAML
+DRIFT_ACTION = "DRIFT (expression differs)"
 
 # Non-data entity categories and the attributes each accepts besides
 # category/allEntities (formats read back from the BIAC API, 2026-10-15).
@@ -130,6 +137,9 @@ def load_config(path):
 
 
 MAX_DESCRIPTION_LENGTH = 250  # BIAC API limit, confirmed by testing against a real cluster
+# BIAC API limit on column-mask / row-filter expression names, observed on SEP 482-e:
+# "name: value may not be more than 30 characters" (POST /expressions/{columnMask,rowFilter}).
+MAX_EXPRESSION_NAME_LENGTH = 30
 
 
 def grant_actions(g):
@@ -184,6 +194,11 @@ def validate_config(config):
             errors.append(f"{context}: role {role!r} is forbidden by this tool "
                            f"(never grant, mask, filter or assign anything on "
                            f"{' / '.join(sorted(FORBIDDEN_ROLES))})")
+
+    def check_expression_name_length(name, kind):
+        if isinstance(name, str) and len(name) > MAX_EXPRESSION_NAME_LENGTH:
+            errors.append(f"{kind} {name!r}: expression name is {len(name)} chars, exceeds the "
+                           f"{MAX_EXPRESSION_NAME_LENGTH}-char BIAC API limit (rename it)")
 
     role_names = set()
     for r in config.get("roles", []):
@@ -307,6 +322,7 @@ def validate_config(config):
             errors.append(f"column_mask {m.get('name')!r} references undeclared role: {role!r}")
         if not m.get("expression"):
             errors.append(f"column_mask {m.get('name')!r}: missing 'expression'")
+        check_expression_name_length(m.get("name"), "column_mask")
         description = m.get("description", "")
         if len(description) > MAX_DESCRIPTION_LENGTH:
             errors.append(f"column_mask {m.get('name')!r}: description is {len(description)} "
@@ -330,6 +346,7 @@ def validate_config(config):
             errors.append(f"row_filter {rf.get('name')!r} references undeclared role: {role!r}")
         if not rf.get("expression"):
             errors.append(f"row_filter {rf.get('name')!r}: missing 'expression'")
+        check_expression_name_length(rf.get("name"), "row_filter")
         description = rf.get("description", "")
         if len(description) > MAX_DESCRIPTION_LENGTH:
             errors.append(f"row_filter {rf.get('name')!r}: description is {len(description)} "
@@ -578,6 +595,21 @@ def _norm(v):
     return v.lower() if isinstance(v, str) else v
 
 
+def expression_text(s):
+    """Whitespace-normalised expression text, used to detect drift."""
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def expression_drifts(existing, wanted_text):
+    """True when an expression found by name has another text than the YAML."""
+    return expression_text(existing.get("expression")) != expression_text(wanted_text)
+
+
+def drift_label(name, existing, wanted_text):
+    return (f"{name} [cluster: {expression_text(existing.get('expression'))} "
+            f"| yaml: {expression_text(wanted_text)}]")
+
+
 def entities_equal(a, b):
     keys = {"category", "catalog", "schema", "table", "function",
             "domainName", "dataProductName", "uiFeature"}
@@ -594,7 +626,9 @@ def entities_equal(a, b):
 
 def plan(client, config):
     """Returns a list of (kind, description, action) where action is
-    'CREATE' or 'SKIP (exists)'. Read-only — no writes."""
+    'CREATE', 'SKIP (exists)' or, for row-filter / column-mask expressions
+    whose text differs from the cluster's, 'DRIFT (expression differs)'.
+    Read-only — no writes."""
     actions = []
     role_ids = {}
 
@@ -611,7 +645,11 @@ def plan(client, config):
         existing = client.find_column_mask_expression(m["name"])
         if existing:
             mask_expr_ids[m["name"]] = existing["id"]
-            actions.append(("column_mask_expression", m["name"], "SKIP (exists)"))
+            if expression_drifts(existing, m["expression"]):
+                actions.append(("column_mask_expression",
+                                drift_label(m["name"], existing, m["expression"]), DRIFT_ACTION))
+            else:
+                actions.append(("column_mask_expression", m["name"], "SKIP (exists)"))
         else:
             actions.append(("column_mask_expression", m["name"], "CREATE"))
 
@@ -647,7 +685,11 @@ def plan(client, config):
         existing = client.find_row_filter_expression(rf["name"])
         if existing:
             rf_expr_ids[rf["name"]] = existing["id"]
-            actions.append(("row_filter_expression", rf["name"], "SKIP (exists)"))
+            if expression_drifts(existing, rf["expression"]):
+                actions.append(("row_filter_expression",
+                                drift_label(rf["name"], existing, rf["expression"]), DRIFT_ACTION))
+            else:
+                actions.append(("row_filter_expression", rf["name"], "SKIP (exists)"))
         else:
             actions.append(("row_filter_expression", rf["name"], "CREATE"))
 
@@ -696,6 +738,13 @@ def describe_entity(entity):
 
 
 def apply(client, config):
+    # Defence in depth: apply() never reuses an expression whose text differs.
+    for key, finder, kind in (("column_masks", client.find_column_mask_expression, "column_mask_expression"),
+                              ("row_filters", client.find_row_filter_expression, "row_filter_expression")):
+        for item in config.get(key, []):
+            existing = finder(item["name"])
+            if existing and expression_drifts(existing, item["expression"]):
+                raise RuntimeError(f"[{kind}] {item['name']}: {DRIFT_ACTION} — refusing to apply")
     role_ids = {}
     for r in config.get("roles", []):
         existing = client.find_role(r["name"])
@@ -907,6 +956,10 @@ def print_plan(actions, title):
         print(f"[{kind}] {label}: {action}")
 
 
+def drift_actions(actions):
+    return [a for a in actions if a[2] == DRIFT_ACTION]
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -962,6 +1015,10 @@ def run(args, secrets):
     if args.dry_run:
         actions = plan(client, config)
         print_plan(actions, "=== Plan (dry-run, no changes made) ===")
+        drifts = drift_actions(actions)
+        if drifts:
+            print(f"\nWARNING: {len(drifts)} expression(s) differ from the cluster (DRIFT) — "
+                  "--apply will refuse until they are aligned.", file=sys.stderr)
         if args.plan_out:
             signed = build_signed_plan(actions, config_bytes, cluster)
             write_plan_file(args.plan_out, signed)
@@ -971,6 +1028,13 @@ def run(args, secrets):
 
     if args.apply:
         actions = plan(client, config)
+        drifts = drift_actions(actions)
+        if drifts:
+            print_plan(actions, "=== Plan ===")
+            print(f"REFUSED: {len(drifts)} expression(s) exist on the cluster with a different text "
+                  "(DRIFT) — nothing was applied. Align the YAML or the cluster, then re-plan.",
+                  file=sys.stderr)
+            return EXIT_DRIFT
         if args.plan:
             signed = load_plan_file(args.plan)
             reasons = check_signed_plan(signed, actions, config_bytes, cluster)

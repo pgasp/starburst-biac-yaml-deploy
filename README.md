@@ -41,8 +41,15 @@ cp -r environments/demo-lab environments/acme-prod
 - ✅ Column masks (CLS)
 - ✅ Row filters (RLS)
 - ✅ Assignments (user/group → role)
-- ❌ Drift detection / pruning of entitlements not in the YAML — never
-  deletes or revokes anything
+- ✅ Drift detection on row-filter / column-mask **expressions**: same name
+  but a different text (whitespace-normalised) is planned as
+  `DRIFT (expression differs)` (both texts shown) and `--apply` refuses
+  (exit code 4) while the plan contains any DRIFT — an existing expression is
+  never silently reused. Align the YAML or the cluster (outside this tool,
+  e.g. an in-place `PUT /api/v1/biac/expressions/rowFilter/{id}`), then
+  re-plan. Identical text stays `SKIP (exists)`.
+- ❌ Pruning of entitlements not in the YAML — never deletes or revokes
+  anything
 - ❌ In-place update of an existing grant/mask/filter's `effect` or
   `expression` — the BIAC API rejects a duplicate create for the same
   action+entity regardless of effect (409 ALREADY_EXISTS), so changing one
@@ -181,6 +188,7 @@ These checks run before any network call, in every mode (`--dry-run`,
 | No `sysadmin` / `public` | A role named `sysadmin` or `public` (any case) cannot be declared, nor be the target of a grant, location grant, column mask, row filter or assignment. |
 | `allowed_users` / `allowed_groups` | Every user (resp. group) in `assignments` must be listed in the root `allowed_users` (resp. `allowed_groups`) of the same file. A missing key means an empty list: any assignment is then refused. Exact, case-sensitive match. The file thus names the accounts it may touch (demo accounts, in the lab). |
 | `allow_catalog_wide` | An `ALLOW` or `ALLOW_WITH_GRANT_OPTION` on a TABLES/FUNCTIONS entity **without `schema`** (whole catalog) is refused unless its catalog is listed in the root `allow_catalog_wide` (case-insensitive, per catalog). `DENY` and schema-scoped grants are not affected. |
+| Expression name length | A `column_masks` / `row_filters` entry whose `name` is longer than 30 characters is refused, with the name and its length (BIAC API limit observed on SEP 482-e: `name: value may not be more than 30 characters`; it otherwise fails midway through `--apply`). Descriptions are capped at 250 characters. Role names: no limit documented or observed, so none is enforced. |
 
 ```yaml
 allowed_users: [demo]
