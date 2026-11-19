@@ -2,7 +2,7 @@
 
 The per-category rules (attributes, how "all" is expressed) live in categories.py.
 """
-from .categories import CASE_SENSITIVE, CATEGORIES, GLOBAL, GLOBAL_SENDS_ALL_ENTITIES, KEYED
+from .categories import CASE_SENSITIVE, CATEGORIES, GLOBAL, GLOBAL_SENDS_ALL_ENTITIES, KEYED, OMIT
 
 # Legacy names (kept for callers of the facade): the non-data categories of the first versions.
 NON_DATA_CATEGORIES_KEYS = {
@@ -34,10 +34,19 @@ def _sorted_columns(entity):
     return sorted(_norm(c) for c in (entity.get("columns") or []))
 
 
+def _is_bare(entity, spec):
+    """A GLOBAL entity, or an OMIT entity ("all" by omission) without any narrowing attribute. The API stores
+    both as allEntities:true and refuses them without it (SEP 482-e, 2026-11-19: 400 "must define some
+    attributes if all entities is false")."""
+    if spec is None or spec.shape not in (GLOBAL, OMIT):
+        return False
+    return spec.shape == GLOBAL or not any(entity.get(k) for k in spec.attrs)
+
+
 def _all_flag(entity):
-    """allEntities as the comparison sees it: a GLOBAL category has a single form, written either way."""
+    """allEntities as the comparison sees it: a bare entity has a single form, written either way."""
     spec = CATEGORIES.get(entity.get("category"))
-    if spec and spec.shape == GLOBAL:
+    if _is_bare(entity, spec):
         return True
     return bool(entity.get("allEntities"))
 
@@ -55,10 +64,10 @@ def entities_equal(a, b):
 
 
 def wire_entity(entity):
-    """The entity as sent to the API: as written, except that a GLOBAL category carries `allEntities: true`
-    (see categories.GLOBAL_SENDS_ALL_ENTITIES)."""
+    """The entity as sent to the API: as written, except that a bare entity (GLOBAL category, or the "all"
+    form of an OMIT category) carries `allEntities: true` (see categories.GLOBAL_SENDS_ALL_ENTITIES)."""
     spec = CATEGORIES.get(entity.get("category"))
-    if spec and spec.shape == GLOBAL and GLOBAL_SENDS_ALL_ENTITIES:
+    if GLOBAL_SENDS_ALL_ENTITIES and _is_bare(entity, spec):
         return {**entity, "allEntities": True}
     return entity
 

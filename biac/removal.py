@@ -175,7 +175,9 @@ class _Removals:
                          f"(expression id {m.get('expressionId')})")
                 self.detach(kind, _ATTACH_STAGE[kind.name], rid, m, label)
         for g in client.list_grants(rid):
-            label = f"REMOVE {name} -> {g.get('effect')} {g.get('action')} on {describe_entity(g.get('entity', {}))}"
+            # APPLY_* grants are read back without an action (SEP 482-e): print none rather than "None".
+            action = f" {g['action']}" if g.get("action") else ""
+            label = f"REMOVE {name} -> {g.get('effect')}{action} on {describe_entity(g.get('entity', {}))}"
             for key in ("columnMaskExpressionId", "rowFilterExpressionId"):
                 if g.get(key) is not None:
                     label += f" ({key}={g[key]})"

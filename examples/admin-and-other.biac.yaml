@@ -70,8 +70,8 @@ grants:
   - {role: ex_support, effect: ALLOW, action: KILL, entity: {category: QUERIES, allEntities: true}}
   - {role: ex_support, effect: ALLOW, action: READ, entity: {category: SYSTEM_INFORMATION}}
   - {role: ex_engineer, effect: DENY, action: WRITE, entity: {category: SYSTEM_INFORMATION}}   # graceful shutdown
-  # AUDIT_LOGS: READ is a guess, not on the privileges page (README, "To confirm on a lab"); denying is safe:
-  - {role: ex_engineer, effect: DENY, action: READ, entity: {category: AUDIT_LOGS}}
+  # AUDIT_LOGS: the API lists SHOW only (SEP 482-e); denying is safe:
+  - {role: ex_engineer, effect: DENY, action: SHOW, entity: {category: AUDIT_LOGS}}
 
   # --- properties: SET ---
   - {role: ex_engineer, effect: ALLOW, action: SET, entity: {category: SYSTEM_SESSION_PROPERTIES, entityKey: query_max_run_time}}

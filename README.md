@@ -186,11 +186,11 @@ authoritative action list.
 | `TABLE_PROPERTIES` | `catalog` (required), `schema`, `table`, `property`, `value` | `SET` | |
 | `CATALOG_SESSION_PROPERTIES` | `catalog` (required), `entityKey` (the property) | `SET` | no `entityKey` = every property of the catalog |
 | `SYSTEM_SESSION_PROPERTIES` | `entityKey` or `allEntities: true` | `SET` | |
-| `ROLES` | `entityKey` or `allEntities: true` | `CREATE` `DROP` `SHOW` | admin; never `sysadmin` / `public` |
+| `ROLES` | `entityKey` or `allEntities: true` | `ALTER` `CREATE` `DROP` `SHOW` | admin; never `sysadmin` / `public` |
 | `USERS` | `entityKey` or `allEntities: true` | `IMPERSONATE` | admin; a named user must be in `allowed_users` |
 | `QUERIES` | — | `EXECUTE` `KILL` `SHOW` | `KILL` is admin |
 | `SYSTEM_INFORMATION` | — | `READ` `WRITE` | admin |
-| `AUDIT_LOGS` | — | `READ` | admin; action list **unverified** |
+| `AUDIT_LOGS` | — | `SHOW` | admin |
 | `COLUMN_MASK_EXPRESSIONS` | `entityKey` (expression name) or `allEntities: true` | `ALTER` `CREATE` `DROP` `SHOW` | admin |
 | `ROW_FILTER_EXPRESSIONS` | `entityKey` or `allEntities: true` | `ALTER` `CREATE` `DROP` `SHOW` | admin |
 | `DATA_PRODUCTS` | `domainName`, `dataProductName` | `ALTER` `CREATE` `DROP` `PUBLISH` `SHOW` | no `domainName` = all (admin opt-in) |
@@ -203,7 +203,7 @@ Actions applied on SEP 482-e lab clusters so far: `TABLES` (`SELECT`, `SHOW`,
 `CREATE`, `DROP`, `ALTER`, `INSERT`, `UPDATE`, `DELETE`, `REFRESH`), `FUNCTIONS`
 (`EXECUTE`, `CREATE`, `DROP`, `SHOW`), `DATA_PRODUCTS` (`SHOW`, `CREATE`, `ALTER`,
 `DROP`, `PUBLISH`), `AI_MODELS` (`EXECUTE`), `USER_INTERFACE` (`SHOW`). Everything
-else in the table comes from the documentation only: see "To confirm on a lab".
+else in the table comes from the documentation only: see "Lab validation".
 
 ### How "all entities" is written
 
@@ -223,7 +223,7 @@ category has one rule, and the other form is refused:
   ambiguous (the API reference reads "empty = all", the SEP UI emits `allEntities`).
 - **`QUERIES`, `AUDIT_LOGS`, `SYSTEM_INFORMATION`**: no attribute. `allEntities:
   true` may be written or omitted; the tool sends `{category, allEntities: true}`
-  and compares both forms as equal (to confirm on a lab).
+  and compares both forms as equal (verified on SEP 482-e).
 - **`DATA_PRODUCTS`, `USER_INTERFACE`**: omit `domainName` / `uiFeature` for "all";
   `allEntities` is refused.
 
@@ -570,40 +570,37 @@ Observed on a lab cluster (SEP 482-e, 2026-11-16), with secure views:
 - Writes require the `sysadmin` BIAC role (or an equivalent BIAC admin
   role) on the connecting user — set via the `X-Trino-Role` header.
 
-## To confirm on a lab
+## Lab validation (SEP 482-e, 2026-11-19)
 
-Written from the documentation and the API reference, never applied on a cluster
-yet. Each point has a safe default in the code; the lab check decides.
+Every point below was checked on a lab cluster by applying one test policy per
+category (`zz_cov_*` roles), reading the API back, re-planning (all `SKIP`),
+re-planning a variant with other case / key order (all `SKIP`), then removing
+everything with `remove:` (all `SKIP (absent)` afterwards).
 
-1. **Actions per category.** Only the actions listed under "Actions applied on SEP
-   482-e lab clusters" are proven. Compare every row of the "Entity categories"
-   table with `GET /api/v1/biac/entityCategories/{category}/actions`; the matrix
-   is one tuple per category in `biac/categories.py`.
-2. **`AUDIT_LOGS`** has no action list on the privileges page nor in the API
-   reference: `READ` is a guess.
-3. **Data access on a table branch.** The privileges page lists `SELECT`, `INSERT`,
-   `UPDATE`, `DELETE` "on a branch"; the API reference has a `tableBranch`
-   attribute on `TABLES` and a separate `TABLE_BRANCHES` category (`branch`).
-   Supported: `TABLES` + `tableBranch`. `TABLE_BRANCHES` accepts only `ALTER`,
-   `CREATE`, `DROP`, `SHOW`; widen it if the cluster lists data actions there.
-4. **Global categories** (`QUERIES`, `AUDIT_LOGS`, `SYSTEM_INFORMATION`): sent as
-   `{category, allEntities: true}`. If the API refuses it, set
-   `GLOBAL_SENDS_ALL_ENTITIES = False` in `biac/categories.py` and compare the
-   read-back.
-5. **"All" of a keyed category** is `allEntities: true` (omitting `entityKey` is
-   refused). Check the read-back is the same form, so a second run is `SKIP`.
-6. **"All" of `DATA_PRODUCTS` / `USER_INTERFACE`** by omission (no `domainName` /
-   `uiFeature`).
-7. **`APPLY_*` grants**: that the API accepts a `TABLES` entity with `table` (and
-   `columns` for a mask) and `columnMaskExpressionId` / `rowFilterExpressionId`,
-   that `GET .../grants` returns the id (the identity of the grant relies on it),
-   and how they relate to the `columnMasks` / `rowFilters` attachments.
-8. **Case of the new attributes**: `entityKey` (except user names, compared as
-   written), `branch`, `property`, `value`, `procedure` are compared
-   case-insensitively; confirm the API lowercases (or keeps) them like
-   catalog/schema/table names.
-9. **Assignment ids** used by `remove.assignments`: `GET /subjects/{users|groups}/{name}/assignments`
-   against `GET /roles/{id}/assignments` (same ids?), see "Removing entitlements".
+1. **Actions per category**: every row of the "Entity categories" table matches
+   `GET /api/v1/biac/entityCategories/{category}/actions`. `AGENT_SKILLS` and
+   `EXTERNAL_MCP_SERVERS` are rejected by SEP 482-e as unknown categories (taken
+   from the docs of newer releases, **untested**).
+2. **`AUDIT_LOGS`**: the only action is `SHOW`.
+3. **Table branches**: `TABLES` + `tableBranch` and `TABLE_BRANCHES` + `branch`
+   are both accepted and read back as written; `TABLE_BRANCHES` lists only
+   `ALTER`, `CREATE`, `DROP`, `SHOW`.
+4. **Bare entities** (`QUERIES`, `AUDIT_LOGS`, `SYSTEM_INFORMATION`, and the "all"
+   form of `DATA_PRODUCTS` / `USER_INTERFACE`): the API refuses an entity
+   without attributes unless `allEntities: true` (400 "must define some
+   attributes if all entities is false") and stores it that way; the tool sends
+   it and compares both written forms as equal.
+5. **"All" of a keyed category**: `allEntities: true` is stored as written.
+6. **`APPLY_*` grants**: accepted on a `TABLES` entity with the expression id;
+   read back **without an `action` field** but with `columnMaskExpressionId` /
+   `rowFilterExpressionId`, so their identity is effect + entity + expression id.
+   They are separate objects from the `columnMasks` / `rowFilters` attachments.
+7. **Case**: property values are stored lowercased (`ORC` → `orc`); compared
+   case-insensitively, as catalog/schema/table names.
+8. **Assignment ids**: `GET /subjects/users/{name}/assignments` and
+   `GET /roles/{id}/assignments` return the same id.
+9. Grants on objects that do not exist yet (procedure, AI model, user) are
+   accepted.
 
 ## Known limitation
 

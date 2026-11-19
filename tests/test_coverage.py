@@ -18,7 +18,7 @@ except ImportError:
 
 bd = base.bd
 from biac.categories import CATEGORIES, OUT_OF_SCOPE_CATEGORIES  # noqa: E402
-from biac.entities import wire_entity  # noqa: E402
+from biac.entities import entities_equal, wire_entity  # noqa: E402
 
 TABLE = {"category": "TABLES", "catalog": "tpch", "schema": "tiny", "table": "nation"}
 
@@ -46,7 +46,7 @@ CASES = {
     "ROLES": ({"category": "ROLES", "entityKey": "zz_other"}, "SHOW", "ROLES"),
     "USERS": ({"category": "USERS", "entityKey": "demo"}, "IMPERSONATE", "USERS"),
     "DATA_PRODUCTS": ({"category": "DATA_PRODUCTS", "domainName": "Sales"}, "SHOW", None),
-    "AUDIT_LOGS": ({"category": "AUDIT_LOGS", "allEntities": True}, "READ", "AUDIT_LOGS"),
+    "AUDIT_LOGS": ({"category": "AUDIT_LOGS", "allEntities": True}, "SHOW", "AUDIT_LOGS"),
     "USER_INTERFACE": ({"category": "USER_INTERFACE", "uiFeature": "SETTINGS"}, "SHOW", None),
     "SYSTEM_INFORMATION": ({"category": "SYSTEM_INFORMATION", "allEntities": True}, "READ", "SYSTEM_INFORMATION"),
     "AI_MODELS": ({"category": "AI_MODELS", "entityKey": "gpt_x"}, "EXECUTE", None),
@@ -711,6 +711,48 @@ class RemoveEveryCategoryTests(unittest.TestCase):
                        "TABLE_BRANCHES:ice.s.t@dev", "PROCEDURES:ice.system.rollback", "UI:SETTINGS",
                        "TABLE_PROPERTIES:ice.s.t#format=ORC"):
             self.assertIn(needle, text)
+
+
+class BareEntityWireTests(unittest.TestCase):
+    """SEP 482-e refuses an entity without attributes unless allEntities is true (400 'must define some
+    attributes if all entities is false', lab 2026-11-19) and stores it with allEntities: true."""
+
+    def test_all_form_of_omit_categories_is_sent_with_all_entities(self):
+        for cat in ("DATA_PRODUCTS", "USER_INTERFACE"):
+            with self.subTest(category=cat):
+                self.assertIs(wire_entity({"category": cat}).get("allEntities"), True)
+
+    def test_narrowed_omit_entity_is_sent_as_written(self):
+        e = {"category": "USER_INTERFACE", "uiFeature": "QUERY_EDITOR"}
+        self.assertEqual(wire_entity(e), e)
+
+    def test_stored_all_form_matches_the_yaml_form(self):
+        for cat in ("DATA_PRODUCTS", "USER_INTERFACE", "QUERIES"):
+            with self.subTest(category=cat):
+                self.assertTrue(entities_equal({"category": cat}, {"category": cat, "allEntities": True}))
+
+
+class ApplyGrantReadBackTests(unittest.TestCase):
+    """SEP 482-e returns APPLY_* grants without an `action` field (lab, 2026-11-19)."""
+
+    def client(self, grants):
+        from biac.client import BiacClient
+        c = object.__new__(BiacClient)
+        c.list_grants = lambda role_id: grants
+        return c
+
+    def test_apply_grant_without_action_is_found(self):
+        entity = {"category": "TABLES", "catalog": "tpch", "schema": "tiny", "table": "nation"}
+        stored = [{"id": 856, "effect": "APPLY_ROW_FILTER", "rowFilterExpressionId": 42,
+                   "entity": dict(entity, allEntities=False)}]
+        c = self.client(stored)
+        self.assertTrue(c.grant_exists(51, "APPLY_ROW_FILTER", "SELECT", entity, expression_id=42))
+        self.assertFalse(c.grant_exists(51, "APPLY_ROW_FILTER", "SELECT", entity, expression_id=43))
+
+    def test_plain_grant_still_compares_the_action(self):
+        entity = {"category": "TABLES", "catalog": "tpch", "schema": "tiny"}
+        c = self.client([{"id": 1, "effect": "ALLOW", "action": "SHOW", "entity": entity}])
+        self.assertFalse(c.grant_exists(1, "ALLOW", "SELECT", entity))
 
 
 if __name__ == "__main__":

@@ -111,9 +111,11 @@ class BiacClient:
         return grant.get("columnMaskExpressionId") or grant.get("rowFilterExpressionId")
 
     def find_grant(self, role_id, effect, action, entity, expression_id=None):
-        """A grant's identity is effect + action + entity, plus the expression id for an APPLY_* effect."""
+        """A grant's identity is effect + action + entity, plus the expression id for an APPLY_* effect.
+        An APPLY_* grant is read back without any `action` (SEP 482-e, 2026-11-19), so its action is not compared."""
         return next((g for g in self.list_grants(role_id)
-                     if g.get("effect") == effect and g.get("action") == action
+                     if g.get("effect") == effect
+                     and (expression_id is not None or g.get("action") == action)
                      and entities_equal(g.get("entity", {}), entity)
                      and (expression_id is None or self._grant_expression_id(g) == expression_id)), None)
 

@@ -11,7 +11,7 @@ TableEntityData, TableBranchEntityData, SingleKeyEntityData, CatalogKeyEntityDat
 GlobalEntityData, PropertyEntityData, FunctionEntityData, ProcedureEntityData,
 DataProductEntityData, UiEntityData). Where the two disagree the matrix is
 strict, unless a grant applied on a lab cluster proves otherwise; the points
-still to be confirmed on a cluster are listed in the README ("To confirm on a lab").
+checked on a cluster are listed in the README ("Lab validation").
 The cluster itself answers authoritatively: GET /api/v1/biac/entityCategories/{category}/actions.
 """
 from collections import namedtuple
@@ -26,8 +26,8 @@ from collections import namedtuple
 #   OMIT    DATA_PRODUCTS / USER_INTERFACE: "all" = omitting the narrower attribute(s); allEntities forbidden.
 SCOPED, KEYED, GLOBAL, OMIT = "scoped", "keyed", "global", "omit"
 
-# Payload of an entity of a GLOBAL category: {category, allEntities: true}. Not proven on a cluster yet
-# (README, "To confirm on a lab"): set to False to send {category} alone.
+# Payload of an entity of a GLOBAL category: {category, allEntities: true}. Verified on SEP 482-e (2026-11-19)
+# (README, "Lab validation").
 GLOBAL_SENDS_ALL_ENTITIES = True
 
 Category = namedtuple("Category", "shape attrs chain actions")
@@ -57,17 +57,19 @@ CATEGORIES = {
                                  ("SET",)),
     "CATALOG_SESSION_PROPERTIES": Category(SCOPED, ("catalog", "entityKey"), (), ("SET",)),
     "SYSTEM_SESSION_PROPERTIES": Category(KEYED, ("entityKey",), (), ("SET",)),
-    "ROLES": Category(KEYED, ("entityKey",), (), ("CREATE", "DROP", "SHOW")),
+    # Action lists below match GET /api/v1/biac/entityCategories/{cat}/actions on SEP 482-e (lab, 2026-11-19).
+    "ROLES": Category(KEYED, ("entityKey",), (), ("ALTER", "CREATE", "DROP", "SHOW")),
     "USERS": Category(KEYED, ("entityKey",), (), ("IMPERSONATE",)),
     "COLUMN_MASK_EXPRESSIONS": Category(KEYED, ("entityKey",), (), ("ALTER", "CREATE", "DROP", "SHOW")),
     "ROW_FILTER_EXPRESSIONS": Category(KEYED, ("entityKey",), (), ("ALTER", "CREATE", "DROP", "SHOW")),
     "AI_MODELS": Category(KEYED, ("entityKey",), (), ("CREATE", "DROP", "EXECUTE", "UPDATE")),
+    # AGENT_SKILLS / EXTERNAL_MCP_SERVERS: from the docs only; SEP 482-e rejects them (400 INVALID_ARGUMENT
+    # entityCategory) — newer SEP releases.
     "AGENT_SKILLS": Category(KEYED, ("entityKey",), (), ("CREATE", "DROP", "UPDATE", "USE")),
     "EXTERNAL_MCP_SERVERS": Category(KEYED, ("entityKey",), (), ("USE",)),
     "QUERIES": Category(GLOBAL, (), (), ("EXECUTE", "KILL", "SHOW")),
-    # AUDIT_LOGS: no action list on the privileges page nor in the API reference; READ (as SYSTEM_INFORMATION)
-    # is the only guess, UNVERIFIED (check with GET .../entityCategories/AUDIT_LOGS/actions).
-    "AUDIT_LOGS": Category(GLOBAL, (), (), ("READ",)),
+    # AUDIT_LOGS: absent from the privileges page; the API lists SHOW only.
+    "AUDIT_LOGS": Category(GLOBAL, (), (), ("SHOW",)),
     "SYSTEM_INFORMATION": Category(GLOBAL, (), (), ("READ", "WRITE")),
     "DATA_PRODUCTS": Category(OMIT, ("domainName", "dataProductName"), (("dataProductName", "domainName"),),
                               ("ALTER", "CREATE", "DROP", "PUBLISH", "SHOW")),
