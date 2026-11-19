@@ -1,4 +1,4 @@
-"""Offline unit tests for biac_deploy.py — simulated BIAC client, no network.
+"""Offline unit tests for biac_deploy.py and the biac/ package — simulated BIAC client, no network.
 
 Run:  python3 -m unittest discover -s tests -v
 """
@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -606,6 +607,75 @@ class ExpressionNameLengthTests(unittest.TestCase):
         errors = validation_errors(self._filter(name))
         self.assertIn(f"row_filter '{name}'", errors)
         self.assertIn(f"{len(name)} chars", errors)
+
+
+class StructureTests(unittest.TestCase):
+    """The tool is split into the biac/ package behind the biac_deploy.py facade."""
+
+    FULL_YAML = EXPR_YAML + "location_grants:\n  - {role: zz_test_reader, location: 's3://b/p/*'}\n" + \
+        "grants:\n  - {role: zz_test_reader, effect: ALLOW, action: SELECT, entity: {category: TABLES, catalog: tpch, schema: tiny, table: nation}}\n" + \
+        "allowed_users: [demo]\nassignments:\n  - {role: zz_test_reader, users: [demo]}\n"
+
+    def test_facade_exposes_the_public_api(self):
+        for name in ("BiacClient", "load_env", "load_config", "parse_config", "validate_config", "plan", "apply",
+                     "verify", "main", "build_signed_plan", "plan_fingerprint", "EXIT_PLAN_REFUSED", "EXIT_DRIFT",
+                     "DRIFT_ACTION"):
+            self.assertTrue(hasattr(bd, name), name)
+
+    def test_loads_by_path_without_the_repo_on_sys_path(self):
+        """Other tools load biac_deploy.py by path (importlib, or sys.path of its directory)."""
+        code = ("import importlib.util, sys; "
+                f"spec = importlib.util.spec_from_file_location('biac_deploy', {bd.__file__!r}); "
+                "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); "
+                "assert callable(m.BiacClient) and callable(m.load_env)")
+        subprocess.run([sys.executable, "-I", "-c", code], check=True)
+
+    def test_plan_and_apply_walk_the_object_kinds_in_the_same_order(self):
+        config = validate(self.FULL_YAML)
+        plan_kinds = []
+        for kind, _, _ in bd.plan(FakeClient(), config):
+            if kind not in plan_kinds:
+                plan_kinds.append(kind)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            bd.apply(FakeClient(), config)
+        apply_tags = []
+        for line in out.getvalue().splitlines():
+            tag = line[1:line.index("]")]
+            if tag not in apply_tags:
+                apply_tags.append(tag)
+        self.assertEqual(plan_kinds, ["role", "column_mask_expression", "grant", "location_grant",
+                                      "column_mask_attach", "row_filter_expression", "row_filter_attach",
+                                      "assignment"])
+        self.assertEqual([k.replace("_attach", "") for k in plan_kinds], apply_tags)
+
+    def test_verify_reads_back_grants_locations_masks_and_filters(self):
+        class Readable(FakeClient):
+            def list_grants(self, role_id):
+                return [{"effect": "ALLOW", "action": "SELECT", "entity": {"category": "TABLES", "catalog": "tpch"}}]
+
+            def list_location_grants(self, role_id):
+                return [{"location": "s3://b/p/*", "grantOption": False}]
+
+            def list_column_masks(self, role_id):
+                return [{"entity": {"category": "TABLES", "catalog": "tpch", "schema": "tiny", "table": "nation",
+                                    "columns": ["comment"]}, "expressionId": 7}]
+
+            def list_row_filters(self, role_id):
+                return [{"entity": {"category": "TABLES", "catalog": "tpch", "schema": "tiny", "table": "nation"},
+                         "expressionId": 8}]
+
+        client = Readable()
+        client.create_role("zz_test_reader")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            bd.verify(client, validate(self.FULL_YAML))
+        text = out.getvalue()
+        self.assertIn("[role] zz_test_reader (id=1)", text)
+        self.assertIn("grant: ALLOW SELECT tpch.*", text)
+        self.assertIn("location_grant: s3://b/p/* (grantOption=False)", text)
+        self.assertIn("column_mask: tpch.tiny.nation.comment (expressionId=7)", text)
+        self.assertIn("row_filter: tpch.tiny.nation (expressionId=8)", text)
 
 
 class ExampleFilesTests(unittest.TestCase):

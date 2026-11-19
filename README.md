@@ -7,10 +7,26 @@ declarative YAML file, via the BIAC REST API.
 ## Structure
 
 ```
-biac_deploy.py   # the tool (single file, PyYAML only)
+biac_deploy.py   # command-line entry point; also re-exports the package (`import biac_deploy`)
+biac/            # the library (stdlib + PyYAML only), one concern per module:
+  policy.py        #   rules and vocabulary: forbidden roles, limits, grant actions, mask/filter kinds
+  entities.py      #   entity comparison (case-insensitive) and display
+  validation.py    #   structural validation and guardrails, one method per file section
+  config.py        #   --env and --config loading
+  client.py        #   BIAC REST client (one generic layer, thin per-object methods)
+  planner.py       #   dry-run plan, expression drift detection
+  executor.py      #   apply (create only) and verify (read-back)
+  signed_plan.py   #   --plan-out / --plan: fingerprint, plan file, refusal reasons
+  cli.py           #   arguments, the four modes, exit codes, error display
 examples/        # generic, commented policies, one per feature (see "Examples")
 tests/           # offline unit tests (simulated BIAC client); they also validate every example
 ```
+
+Where to change what: a new guardrail goes in `validation.py`; a new kind of
+object needs `validation.py`, `client.py`, and a stage in both `planner.py`
+and `executor.py` (the two walk the kinds in the same order; a test checks it).
+Column masks and row filters share one code path (`ExpressionKind` in
+`policy.py`).
 
 **This repository holds no customer policy.** Real policy files live with the
 project they belong to (one `<name>.biac.yaml` per cluster and use case, next to
