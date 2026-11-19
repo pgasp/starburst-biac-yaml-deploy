@@ -39,21 +39,20 @@ Design:
   an existing one, list it under `remove:` and apply, then move it back to
   its creation section with the new value and apply again (one file cannot
   create and remove the same object).
-- allEntities:true is never emitted for data entities — TABLES/FUNCTIONS
-  are always scoped (catalog, catalog+schema, or catalog+schema+table/
-  function), matching the BIAC API constraint that allEntities:true forbids
-  any other attribute. Sole exception: AI_MODELS, where allEntities:true
-  ("all AI models") is what the SEP UI itself emits.
+- allEntities:true is never emitted for catalog-rooted entities (TABLES,
+  FUNCTIONS, ...): they are always scoped (catalog, catalog+schema, or
+  catalog+schema+table/function), matching the BIAC API constraint that
+  allEntities:true forbids any other attribute. It is the way to say "all" on
+  the categories that have an `entityKey` (ROLES, USERS, AI_MODELS, ...) and on
+  the global ones (QUERIES, AUDIT_LOGS, SYSTEM_INFORMATION).
+- Administrative grants (ROLES, USERS, SYSTEM_INFORMATION, AUDIT_LOGS, mask and
+  filter expressions, QUERIES:KILL) and "all" forms need the root opt-in
+  `allow_admin_privileges: [CATEGORY or CATEGORY:ACTION]`; DENY never does.
 
-Supported entity categories (grants):
-  TABLES         {category: TABLES, catalog, [schema], [table]}
-  FUNCTIONS      {category: FUNCTIONS, catalog, [schema], [function]}
-  DATA_PRODUCTS  {category: DATA_PRODUCTS, domainName, [dataProductName]}
-                 (domainName alone = every data product of the domain)
-  AI_MODELS      {category: AI_MODELS, allEntities: true}
-  USER_INTERFACE {category: USER_INTERFACE, uiFeature}
-                 (e.g. AI_MODELS, DATA_PRODUCTS, QUERY_EDITOR, CATALOG_EXPLORER)
-Formats read back from the BIAC API on a lab cluster (2026-10-15).
+Supported entity categories (grants), with their attributes and actions: see
+the README, "Entity categories" (single table: biac/categories.py). Effects:
+ALLOW, ALLOW_WITH_GRANT_OPTION, DENY, and APPLY_COLUMN_MASK / APPLY_ROW_FILTER
+(+ _WITH_GRANT_OPTION) naming an expression by `column_mask` / `row_filter`.
 Column masks and row filters only accept TABLES.
 Location grants (top-level 'location_grants': role, location, grant_option)
 use their own endpoint /api/v1/biac/roles/{id}/locationGrants.
@@ -80,6 +79,7 @@ from biac.entities import (NON_DATA_CATEGORIES, NON_DATA_CATEGORIES_KEYS, _norm,
 from biac.executor import apply, verify  # noqa: E402,F401
 from biac.planner import (DRIFT_ACTION, drift_actions, drift_label, expression_drifts,  # noqa: E402,F401
                           expression_text, plan, print_plan)
+from biac.categories import CATEGORIES  # noqa: E402,F401
 from biac.policy import (FORBIDDEN_ROLES, MAX_DESCRIPTION_LENGTH, MAX_EXPRESSION_NAME_LENGTH,  # noqa: E402,F401
                          ROLE_NAME_RE, WIDENING_EFFECTS, grant_actions)
 from biac.removal import (DELETE, SKIP_ABSENT, apply_removals, plan_removals, removal_actions,  # noqa: E402,F401

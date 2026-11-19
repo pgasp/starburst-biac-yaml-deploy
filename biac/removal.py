@@ -15,7 +15,7 @@ from collections import namedtuple
 from functools import partial
 
 from .entities import describe_entity
-from .policy import COLUMN_MASKS, FORBIDDEN_ROLES, ROW_FILTERS, grant_actions
+from .policy import COLUMN_MASKS, FORBIDDEN_ROLES, ROW_FILTERS, apply_kind, grant_actions
 
 DELETE = "DELETE"
 SKIP_ABSENT = "SKIP (absent)"
@@ -81,9 +81,17 @@ class _Removals:
     def grants(self):
         for g in self.items("grants"):
             rid = self.role_id(g["role"])
+            kind = apply_kind(g)
+            # APPLY_* grant: its identity includes the expression; no such expression = nothing to remove
+            expression = kind.find(self.client, g[kind.name]) if kind else None
+            suffix = f" ({kind.name} {g[kind.name]})" if kind else ""
             for action in grant_actions(g):
-                label = f"REMOVE {g['role']} -> {g['effect']} {action} on {describe_entity(g['entity'])}"
-                found = rid and self.client.find_grant(rid, g["effect"], action, g["entity"])
+                label = f"REMOVE {g['role']} -> {g['effect']} {action} on {describe_entity(g['entity'])}{suffix}"
+                if kind:
+                    found = rid and expression and self.client.find_grant(
+                        rid, g["effect"], action, g["entity"], expression_id=expression["id"])
+                else:
+                    found = rid and self.client.find_grant(rid, g["effect"], action, g["entity"])
                 self.found_step(STAGE_GRANTS, "remove_grant", label, found,
                                 lambda f, r=rid: self.client.delete_grant(r, f["id"]), (rid, found and found["id"]))
 
@@ -168,6 +176,9 @@ class _Removals:
                 self.detach(kind, _ATTACH_STAGE[kind.name], rid, m, label)
         for g in client.list_grants(rid):
             label = f"REMOVE {name} -> {g.get('effect')} {g.get('action')} on {describe_entity(g.get('entity', {}))}"
+            for key in ("columnMaskExpressionId", "rowFilterExpressionId"):
+                if g.get(key) is not None:
+                    label += f" ({key}={g[key]})"
             self.found_step(STAGE_GRANTS, "remove_grant", label, g,
                             lambda f: client.delete_grant(rid, f["id"]), (rid, g["id"]))
         for lg in client.list_location_grants(rid):

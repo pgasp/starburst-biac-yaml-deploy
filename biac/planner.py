@@ -3,12 +3,12 @@
 The order of the stages below is the order of the plan, and the same as in
 executor.apply: roles, column-mask expressions, grants, location grants,
 column-mask attachments, row-filter expressions, row-filter attachments,
-assignments; then the removals of the `remove:` section (removal.py).
+APPLY_* grants (they need both kinds of expression), assignments; then the removals of the `remove:` section (removal.py).
 """
 import re
 
 from .entities import describe_entity
-from .policy import COLUMN_MASKS, ROW_FILTERS, grant_actions
+from .policy import COLUMN_MASKS, ROW_FILTERS, apply_kind, grant_actions
 from .removal import DELETE, plan_removals, removal_actions
 
 CREATE = "CREATE"
@@ -90,10 +90,41 @@ class _Planner:
 
     def grants(self):
         for g in self.config.get("grants", []):
+            if apply_kind(g):
+                continue   # planned after the expressions, see apply_grants
             role_id = self.role_ids.get(g["role"])
             for action in grant_actions(g):
                 label = f"{g['role']} -> {g['effect']} {action} on {describe_entity(g['entity'])}"
                 self.add("grant", label, role_id and self.client.grant_exists(role_id, g["effect"], action, g["entity"]))
+
+    def expression_id(self, kind, name, context):
+        """Id of the expression an APPLY_* grant names: on the cluster already, or None when this very file
+        creates it. Neither: the plan cannot be built (ValueError, exit code 2, nothing written)."""
+        known = self.expr_ids.get(kind.name, {}).get(name)
+        if known:
+            return known
+        existing = kind.find(self.client, name)
+        if existing:
+            return existing["id"]
+        if any(item.get("name") == name for item in self.config.get(kind.section, [])):
+            return None
+        raise ValueError(f"{context}: {kind.name} expression {name!r} does not exist on the cluster and is not "
+                         f"declared under '{kind.section}' in this file")
+
+    def apply_grants(self):
+        for g in self.config.get("grants", []):
+            kind = apply_kind(g)
+            if not kind:
+                continue
+            name = g[kind.name]
+            expr_id = self.expression_id(kind, name, f"grant on role {g['role']!r}")
+            role_id = self.role_ids.get(g["role"])
+            for action in grant_actions(g):
+                label = (f"{g['role']} -> {g['effect']} {action} on {describe_entity(g['entity'])} "
+                         f"({kind.name} {name})")
+                self.add("apply_grant", label,
+                         role_id and expr_id is not None
+                         and self.client.grant_exists(role_id, g["effect"], action, g["entity"], expression_id=expr_id))
 
     def location_grants(self):
         for lg in self.config.get("location_grants", []):
@@ -134,5 +165,6 @@ def plan(client, config):
     p.attachments(COLUMN_MASKS)
     p.expressions(ROW_FILTERS)
     p.attachments(ROW_FILTERS)
+    p.apply_grants()
     p.assignments()
     return p.actions + removal_actions(plan_removals(client, config))

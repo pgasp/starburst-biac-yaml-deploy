@@ -7,12 +7,12 @@ check) so a removal is held to the same rules as the creation it undoes.
 import re
 
 from .entities import entities_equal
-from .policy import COLUMN_MASKS, EFFECTS, ROLE_NAME_RE, ROW_FILTERS, grant_actions
+from .policy import COLUMN_MASKS, ROLE_NAME_RE, ROW_FILTERS, apply_expression_name, grant_actions
 
 KNOWN_REMOVE_KEYS = {"grants", "location_grants", "column_masks", "row_filters", "assignments", "roles"}
 # An entry cut from a creation section can be pasted as is: the keys that only
 # matter for a creation (expression, description) are accepted and ignored.
-KNOWN_REMOVE_GRANT_KEYS = {"role", "effect", "action", "entity"}
+KNOWN_REMOVE_GRANT_KEYS = {"role", "effect", "action", "entity", "column_mask", "row_filter"}
 KNOWN_REMOVE_LOCATION_GRANT_KEYS = {"role", "location", "grant_option"}
 KNOWN_REMOVE_EXPRESSION_KEYS = {"name", "role", "entity", "delete_expression", "expression", "description"}
 KNOWN_REMOVE_ASSIGNMENT_KEYS = {"role", "users", "groups"}
@@ -79,11 +79,9 @@ class _RemoveChecks:
             context = f"remove.grants on role {g.get('role')!r}"
             self.v.check_unknown_keys(g, KNOWN_REMOVE_GRANT_KEYS, context)
             self.role(g.get("role"), context)
-            if g.get("effect") not in EFFECTS:
-                self.error(f"{context}: invalid or missing 'effect'")
-            if not grant_actions(g):
-                self.error(f"{context}: missing 'action' (string or list of strings)")
-            self.entity(g, context)
+            # same effect / action matrix / APPLY_* key / entity rules as the creation; no admin opt-in:
+            # a removal never widens anything
+            self.v.check_grant_content(g, context)
 
     def location_grants(self):
         for lg in self.entries("location_grants"):
@@ -148,6 +146,7 @@ class _RemoveChecks:
             for c in _dicts(self.config, "grants"):
                 same = (r.get("role") == c.get("role") and r.get("effect") == c.get("effect")
                         and set(grant_actions(r)) & set(grant_actions(c))
+                        and apply_expression_name(r) == apply_expression_name(c)
                         and _same_entity(r, c))
                 if same:
                     self.error(f"remove.grants on role {r.get('role')!r}: the same grant "

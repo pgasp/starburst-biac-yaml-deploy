@@ -8,92 +8,18 @@ checks are pure functions returning their error messages.
 import re
 import sys
 
-from .entities import NON_DATA_CATEGORIES, NON_DATA_CATEGORIES_KEYS
-from .policy import (COLUMN_MASKS, EFFECTS, FORBIDDEN_ROLES, MAX_DESCRIPTION_LENGTH,
+from .categories import CATEGORIES, SCOPED, admin_opt_ins_needed, is_all_form, valid_admin_token
+from .entity_validation import entity_errors  # noqa: F401  (re-exported: the pure entity checks)
+from .policy import (APPLY_EFFECTS, COLUMN_MASKS, EFFECTS, FORBIDDEN_ROLES, MAX_DESCRIPTION_LENGTH,
                      MAX_EXPRESSION_NAME_LENGTH, ROLE_NAME_RE, ROW_FILTERS, WIDENING_EFFECTS,
-                     grant_actions)
+                     apply_kind, grant_actions)
 from .remove_validation import check_remove
 
 KNOWN_TOP_LEVEL_KEYS = {"roles", "grants", "location_grants", "column_masks", "row_filters", "assignments",
-                        "allow_catalog_wide", "allowed_users", "allowed_groups", "remove"}
-KNOWN_GRANT_KEYS = {"role", "effect", "action", "entity"}
+                        "allow_catalog_wide", "allowed_users", "allowed_groups", "allow_admin_privileges", "remove"}
+KNOWN_GRANT_KEYS = {"role", "effect", "action", "entity", "column_mask", "row_filter"}
 KNOWN_LOCATION_GRANT_KEYS = {"role", "location", "grant_option"}
 KNOWN_EXPRESSION_KEYS = {"name", "description", "expression", "role", "entity"}  # masks and filters
-
-
-# --------------------------------------------------------------------------
-# Entities (pure: return the list of error messages)
-# --------------------------------------------------------------------------
-
-def entity_errors(entity, context, tables_only=False):
-    category = entity.get("category")
-    if not tables_only and category in NON_DATA_CATEGORIES:
-        return _non_data_entity_errors(entity, context)
-    if entity.get("allEntities") is True:
-        return [f"{context}: allEntities:true is forbidden by this tool "
-                f"— scope the entity explicitly (catalog, or catalog+schema, "
-                f"or catalog+schema+table/function)"]
-    errors = []
-    # A catalog-wide or schema-wide grant is expressed by OMITTING the
-    # narrower field(s) entirely — 'catalog' alone means catalog.*,
-    # 'catalog'+'schema' alone means catalog.schema.*. A literal '*'
-    # string is NOT the mechanism for this (confirmed on a test
-    # cluster, 2026-10-01) — reject it explicitly so it's never confused with
-    # omission.
-    for field in ("schema", "table", "function"):
-        if entity.get(field) == "*":
-            errors.append(f"{context}: '*' is not a valid wildcard for '{field}' — "
-                          f"omit '{field}' entirely instead for a catalog/schema-wide grant")
-    allowed = ("TABLES",) if tables_only else ("TABLES", "FUNCTIONS") + NON_DATA_CATEGORIES
-    if category not in allowed:
-        errors.append(f"{context}: unsupported or missing entity category {category!r} "
-                      f"(expected one of {', '.join(allowed)})")
-        return errors
-    return errors + _data_scope_errors(entity, category, context)
-
-
-def _data_scope_errors(entity, category, context):
-    """TABLES / FUNCTIONS: a catalog is required, a table/function needs its schema."""
-    errors = []
-    if not entity.get("catalog"):
-        errors.append(f"{context}: entity missing 'catalog'")
-    if category == "TABLES" and entity.get("function"):
-        errors.append(f"{context}: TABLES entity must not set 'function'")
-    if category == "FUNCTIONS" and entity.get("table"):
-        errors.append(f"{context}: FUNCTIONS entity must not set 'table'")
-    narrow_field = "table" if category == "TABLES" else "function"
-    if entity.get(narrow_field) and not entity.get("schema"):
-        errors.append(f"{context}: '{narrow_field}' given without 'schema' "
-                      f"— a {narrow_field} always needs its schema specified")
-    return errors
-
-
-def _non_data_entity_errors(entity, context):
-    """DATA_PRODUCTS / AI_MODELS / USER_INTERFACE."""
-    errors = []
-    category = entity["category"]
-    allowed_keys = {"category", "allEntities"} | set(NON_DATA_CATEGORIES_KEYS[category])
-    stray = set(entity.keys()) - allowed_keys
-    if stray:
-        errors.append(f"{context}: {category} entity does not accept {sorted(stray)} "
-                      f"(allowed: {sorted(allowed_keys)})")
-    if category == "AI_MODELS":
-        if entity.get("allEntities") is not True:
-            errors.append(f"{context}: AI_MODELS entity must set 'allEntities: true' "
-                          f"(per-model scoping is not supported by this tool)")
-        return errors
-    if entity.get("allEntities") is True:
-        errors.append(f"{context}: allEntities:true is forbidden for {category} "
-                      f"— scope it explicitly")
-    if category == "DATA_PRODUCTS":
-        if not entity.get("domainName"):
-            errors.append(f"{context}: DATA_PRODUCTS entity needs 'domainName' "
-                          f"(add 'dataProductName' to target a single data product)")
-        if entity.get("domainName") == "*" or entity.get("dataProductName") == "*":
-            errors.append(f"{context}: '*' is not a wildcard — omit 'dataProductName' instead")
-    if category == "USER_INTERFACE" and not entity.get("uiFeature"):
-        errors.append(f"{context}: USER_INTERFACE entity needs 'uiFeature'")
-    return errors
 
 
 # --------------------------------------------------------------------------
@@ -109,6 +35,7 @@ class _Validator:
         self.allow_catalog_wide = set()
         self.allowed_users = set()
         self.allowed_groups = set()
+        self.allow_admin = set()
 
     def run(self):
         self.check_top_level_keys()
@@ -163,6 +90,11 @@ class _Validator:
         self.allow_catalog_wide = {c.lower() for c in self.declared_names("allow_catalog_wide")}
         self.allowed_users = self.declared_names("allowed_users")
         self.allowed_groups = self.declared_names("allowed_groups")
+        self.allow_admin = self.declared_names("allow_admin_privileges")
+        for token in sorted(self.allow_admin):
+            if not valid_admin_token(token):
+                self.errors.append(f"allow_admin_privileges: {token!r} is not 'CATEGORY' or 'CATEGORY:ACTION' of a "
+                                   f"supported category/action (upper case, e.g. ROLES or QUERIES:KILL)")
 
     # --- roles ---
 
@@ -192,25 +124,109 @@ class _Validator:
                                f"use 'action: [CREATE, DELETE, SELECT]' instead)")
         if role not in self.role_names:
             self.errors.append(f"grant references undeclared role: {role!r}")
+        self.check_role_not_forbidden(role, context)
+        entity = self.check_grant_content(g, context)
+        if entity is not None:
+            self.check_catalog_wide(g, entity, context)
+            self.check_admin_privileges(g, entity, context)
+            self.check_impersonation_targets(g, entity, context)
+
+    def check_grant_content(self, g, context):
+        """What a grant and a removed grant have in common: effect, actions per category, the APPLY_* expression
+        key, the entity. Returns the entity (None when it is not a mapping)."""
         if g.get("effect") not in EFFECTS:
             self.errors.append(f"{context}: invalid or missing 'effect'")
         if not grant_actions(g):
             self.errors.append(f"{context}: missing 'action' (string or list of strings)")
-        self.check_role_not_forbidden(role, context)
-        entity = g.get("entity", {})
+        entity = g.get("entity")
+        if not isinstance(entity, dict):
+            self.errors.append(f"{context}: missing or invalid 'entity'")
+            return None
         self.check_entity(entity, context)
-        self.check_catalog_wide(g, entity, context)
+        self.check_actions(g, entity, context)
+        self.check_apply_grant(g, entity, context)
+        return entity
+
+    def check_actions(self, g, entity, context):
+        """Offline per-category action matrix (categories.CATEGORIES)."""
+        spec = CATEGORIES.get(entity.get("category"))
+        if not spec:
+            return   # the entity check already reported the category
+        for action in grant_actions(g):
+            if not isinstance(action, str):
+                self.errors.append(f"{context}: action {action!r} must be a string")
+            elif action not in spec.actions:
+                self.errors.append(f"{context}: action {action!r} is not valid for category "
+                                   f"{entity.get('category')} (allowed: {', '.join(spec.actions)})")
+
+    def check_apply_grant(self, g, entity, context):
+        """APPLY_* grants: a mask / filter named by `column_mask` / `row_filter`, on TABLES, action SELECT."""
+        effect, kind = g.get("effect"), apply_kind(g)
+        others = [k for k in ("column_mask", "row_filter") if k in g and not (kind and k == kind.name)]
+        if kind is None:
+            for key in others:
+                self.errors.append(f"{context}: '{key}' is only for the APPLY_* effects "
+                                   f"({', '.join(APPLY_EFFECTS)})")
+            return
+        for key in others:
+            self.errors.append(f"{context}: {effect} takes '{kind.name}', not '{key}'")
+        name = g.get(kind.name)
+        if not isinstance(name, str) or not name:
+            self.errors.append(f"{context}: {effect} needs '{kind.name}: <expression name>' "
+                               f"(declared under '{kind.section}' in this file, or already on the cluster)")
+        elif len(name) > MAX_EXPRESSION_NAME_LENGTH:
+            self.errors.append(f"{context}: expression name {name!r} is {len(name)} chars, exceeds the "
+                               f"{MAX_EXPRESSION_NAME_LENGTH}-char BIAC API limit")
+        if entity.get("category") != "TABLES":
+            self.errors.append(f"{context}: {effect} applies to a TABLES entity only")
+        if [a for a in grant_actions(g) if a != "SELECT"] or len(grant_actions(g)) != 1:
+            self.errors.append(f"{context}: {effect} takes the single action SELECT "
+                               f"(masks and filters apply to SELECT)")
+        if entity.get("category") == "TABLES":
+            (self.check_mask_entity if kind is COLUMN_MASKS else self.check_row_filter_entity)(context, entity)
 
     def check_catalog_wide(self, g, entity, context):
         """ALLOW on a whole catalog needs an explicit opt-in (root 'allow_catalog_wide')."""
-        if (g.get("effect") in WIDENING_EFFECTS
-                and entity.get("category") in ("TABLES", "FUNCTIONS")
-                and entity.get("catalog") and not entity.get("schema")
+        if (g.get("effect") in WIDENING_EFFECTS and _catalog_wide(entity)
                 and str(entity["catalog"]).lower() not in self.allow_catalog_wide):
             self.errors.append(f"{context}: {g.get('effect')} on the whole catalog "
                                f"{entity['catalog']!r} (no schema) requires an explicit opt-in — add "
                                f"'allow_catalog_wide: [{entity['catalog']}]' at the root of the file, "
                                f"or scope the grant to a schema")
+
+    def check_admin_privileges(self, g, entity, context):
+        """A widening grant on an administrative category, or on an 'all' form, needs the root opt-in
+        'allow_admin_privileges' (the category, or CATEGORY:ACTION). DENY never does. Delegating the right to
+        apply a mask / filter (APPLY_*_WITH_GRANT_OPTION) needs the category of its expressions."""
+        effect = g.get("effect")
+        if effect not in WIDENING_EFFECTS or not isinstance(entity.get("category"), str):
+            return
+        needed = admin_opt_ins_needed(entity["category"], grant_actions(g), entity)
+        kind = apply_kind(g)
+        if kind and effect.endswith("_WITH_GRANT_OPTION"):
+            needed.append((kind.admin_category, None))
+        for category, action in needed:
+            if category in self.allow_admin or (action and f"{category}:{action}" in self.allow_admin):
+                continue
+            if action:
+                what, tokens = f"{action} on {category} ({_admin_reason(entity)})", f"{category}:{action}' (or '{category}"
+            else:
+                what, tokens = f"delegating a {kind.name} (grant option)", category
+            self.errors.append(f"{context}: {effect} {what} requires an explicit opt-in — add "
+                               f"'allow_admin_privileges: [{tokens}]' at the root of the file, or scope the grant")
+
+    def check_impersonation_targets(self, g, entity, context):
+        """Allowing a role to impersonate a named user is subject to `allowed_users`, like an assignment;
+        a role or a user named sysadmin/public can never be the target of a widening grant."""
+        if g.get("effect") not in WIDENING_EFFECTS:
+            return
+        key = entity.get("entityKey")
+        if entity.get("category") == "USERS" and isinstance(key, str) and key not in self.allowed_users:
+            self.errors.append(f"{context}: IMPERSONATE on user {key!r}, which is not declared in the root "
+                               f"'allowed_users' list of this file (fail closed)")
+        if entity.get("category") == "ROLES" and isinstance(key, str) and key.lower() in FORBIDDEN_ROLES:
+            self.errors.append(f"{context}: role {key!r} is forbidden by this tool (never grant anything on "
+                               f"{' / '.join(sorted(FORBIDDEN_ROLES))})")
 
     # --- location grants ---
 
@@ -294,6 +310,20 @@ class _Validator:
             if name not in allowed:
                 self.errors.append(f"assignment on role {role!r}: {key[:-1]} {name!r} is not declared in "
                                    f"the root '{declared_key}' list of this file (fail closed)")
+
+
+def _catalog_wide(entity):
+    """A catalog-rooted entity with nothing narrower than the catalog: everything in the catalog."""
+    spec = CATEGORIES.get(entity.get("category"))
+    if not spec or spec.shape != SCOPED or not entity.get("catalog"):
+        return False
+    if entity["category"] == "CATALOG_SESSION_PROPERTIES":
+        return not entity.get("entityKey")
+    return not entity.get("schema")
+
+
+def _admin_reason(entity):
+    return "all entities" if is_all_form(entity) else "administrative category"
 
 
 def validate_config(config):

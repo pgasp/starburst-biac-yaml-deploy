@@ -8,7 +8,7 @@ import json
 
 from .entities import describe_entity
 from .planner import DRIFT_ACTION, expression_drifts
-from .policy import COLUMN_MASKS, ROW_FILTERS, grant_actions
+from .policy import COLUMN_MASKS, ROW_FILTERS, apply_kind, grant_actions
 from .removal import apply_removals, plan_removals, verify_removals
 
 EXPRESSION_KINDS = (COLUMN_MASKS, ROW_FILTERS)
@@ -66,11 +66,33 @@ class _Applier:
 
     def grants(self):
         for g in self.config.get("grants", []):
+            if apply_kind(g):
+                continue   # created after the expressions, see apply_grants
             role_id = self.role_ids[g["role"]]
             for action in grant_actions(g):
                 _ensure("grant", f"{g['role']} {g['effect']} {action} {describe_entity(g['entity'])}",
                         self.client.grant_exists(role_id, g["effect"], action, g["entity"]),
                         lambda: self.client.create_grant(role_id, g["effect"], action, g["entity"]))
+
+    def apply_grants(self):
+        """APPLY_* grants: the expression is resolved by name to its id (created by this run, or already there)."""
+        for g in self.config.get("grants", []):
+            kind = apply_kind(g)
+            if not kind:
+                continue
+            name = g[kind.name]
+            existing = kind.find(self.client, name)
+            expr_id = self.expr_ids.get(kind.name, {}).get(name) or (existing and existing["id"])
+            if not expr_id:
+                raise ValueError(f"grant on role {g['role']!r}: {kind.name} expression {name!r} does not exist "
+                                 f"on the cluster and is not declared under '{kind.section}' in this file")
+            role_id = self.role_ids[g["role"]]
+            for action in grant_actions(g):
+                _ensure("apply_grant", f"{g['role']} {g['effect']} {action} {describe_entity(g['entity'])} "
+                                       f"({kind.name} {name})",
+                        self.client.grant_exists(role_id, g["effect"], action, g["entity"], expression_id=expr_id),
+                        lambda: self.client.create_grant(role_id, g["effect"], action, g["entity"],
+                                                         expression_id=expr_id))
 
     def location_grants(self):
         for lg in self.config.get("location_grants", []):
@@ -110,6 +132,7 @@ def apply(client, config):
     a.attachments(COLUMN_MASKS)
     a.expressions(ROW_FILTERS)
     a.attachments(ROW_FILTERS)
+    a.apply_grants()
     a.assignments()
     apply_removals(removals)
 
@@ -124,8 +147,13 @@ def verify(client, config):
         role_id = existing["id"]
         print(f"[role] {r['name']} (id={role_id})")
         for g in client.list_grants(role_id):
+            expression = ""
+            for key in ("columnMaskExpressionId", "rowFilterExpressionId"):
+                if g.get(key) is not None:
+                    expression = f" ({key}={g[key]})"
             print(f"    grant: {g.get('effect')} {g.get('action')} "
-                  f"{describe_entity(g.get('entity', {}))}  {json.dumps(g.get('entity', {}), sort_keys=True)}")
+                  f"{describe_entity(g.get('entity', {}))}{expression}  "
+                  f"{json.dumps(g.get('entity', {}), sort_keys=True)}")
         for lg in client.list_location_grants(role_id):
             print(f"    location_grant: {lg.get('location')} (grantOption={lg.get('grantOption')})")
         for kind in EXPRESSION_KINDS:

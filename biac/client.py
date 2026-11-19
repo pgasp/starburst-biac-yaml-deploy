@@ -10,7 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .entities import entities_equal
+from .entities import entities_equal, wire_entity
 
 API = "/api/v1/biac"
 
@@ -105,19 +105,29 @@ class BiacClient:
     def list_grants(self, role_id):
         return self._list(f"/roles/{role_id}/grants")
 
-    def find_grant(self, role_id, effect, action, entity):
+    @staticmethod
+    def _grant_expression_id(grant):
+        """The mask / filter expression id an APPLY_* grant carries (None for a plain grant)."""
+        return grant.get("columnMaskExpressionId") or grant.get("rowFilterExpressionId")
+
+    def find_grant(self, role_id, effect, action, entity, expression_id=None):
+        """A grant's identity is effect + action + entity, plus the expression id for an APPLY_* effect."""
         return next((g for g in self.list_grants(role_id)
                      if g.get("effect") == effect and g.get("action") == action
-                     and entities_equal(g.get("entity", {}), entity)), None)
+                     and entities_equal(g.get("entity", {}), entity)
+                     and (expression_id is None or self._grant_expression_id(g) == expression_id)), None)
 
-    def grant_exists(self, role_id, effect, action, entity):
-        return self.find_grant(role_id, effect, action, entity) is not None
+    def grant_exists(self, role_id, effect, action, entity, expression_id=None):
+        return self.find_grant(role_id, effect, action, entity, expression_id) is not None
 
     def delete_grant(self, role_id, grant_id):
         self._delete(f"/roles/{role_id}/grants/{grant_id}")
 
-    def create_grant(self, role_id, effect, action, entity):
-        return self._post(f"/roles/{role_id}/grants", {"effect": effect, "action": action, "entity": entity})
+    def create_grant(self, role_id, effect, action, entity, expression_id=None):
+        body = {"effect": effect, "action": action, "entity": wire_entity(entity)}
+        if expression_id is not None:   # APPLY_COLUMN_MASK* / APPLY_ROW_FILTER*
+            body["columnMaskExpressionId" if "COLUMN_MASK" in effect else "rowFilterExpressionId"] = expression_id
+        return self._post(f"/roles/{role_id}/grants", body)
 
     # --- location grants (separate endpoint from entity grants) ---
     def list_location_grants(self, role_id):

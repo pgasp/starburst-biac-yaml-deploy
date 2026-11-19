@@ -9,8 +9,10 @@ declarative YAML file, via the BIAC REST API.
 ```
 biac_deploy.py   # command-line entry point; also re-exports the package (`import biac_deploy`)
 biac/            # the library (stdlib + PyYAML only), one concern per module:
-  policy.py        #   rules and vocabulary: forbidden roles, limits, grant actions, mask/filter kinds
-  entities.py      #   entity comparison (case-insensitive) and display
+  policy.py        #   rules and vocabulary: forbidden roles, effects, limits, grant actions, mask/filter kinds
+  categories.py    #   the entity categories: attributes, actions, "all" form, admin guardrail table
+  entities.py      #   entity comparison (case-insensitive), display and wire format
+  entity_validation.py #  structural validation of one entity, per category
   validation.py    #   structural validation and guardrails, one method per file section
   remove_validation.py #  the same for the `remove:` section (incl. create/remove conflicts)
   config.py        #   --env and --config loading
@@ -24,7 +26,8 @@ examples/        # generic, commented policies, one per feature (see "Examples")
 tests/           # offline unit tests (simulated BIAC client); they also validate every example
 ```
 
-Where to change what: a new guardrail goes in `validation.py`; a new kind of
+Where to change what: a new category, attribute or action goes in the one table of
+`categories.py`; a new guardrail goes in `validation.py`; a new kind of
 object needs `validation.py`, `client.py`, and a stage in both `planner.py`
 and `executor.py` (the two walk the kinds in the same order; a test checks it);
 removals live in `removal.py` (one list of steps read by plan, apply and verify).
@@ -44,8 +47,15 @@ the names.
 ## Scope (v1)
 
 - ✅ Roles
-- ✅ Grants (tables/functions, data products, AI models, UI features),
-  including column-level `SELECT` grants (`entity.columns`)
+- ✅ Grants on every SEP entity category of the built-in access control
+  (tables, table branches, functions, procedures, session / schema / table
+  properties, roles, users, queries, system information, audit logs, column mask
+  and row filter expressions, data products, AI models, agent skills, external MCP
+  servers, UI features), including column-level `SELECT` grants
+  (`entity.columns`): see "Entity categories". Spark, notebooks and S3
+  governance categories are refused as out of scope.
+- ✅ `APPLY_COLUMN_MASK` / `APPLY_ROW_FILTER` grant effects, expression referenced
+  by name (see "APPLY_* effects")
 - ✅ Location grants (`location_grants`, separate endpoint `/locationGrants`)
 - ✅ Column masks (CLS)
 - ✅ Row filters (RLS)
@@ -143,6 +153,7 @@ validating.
 | [`functions.biac.yaml`](examples/functions.biac.yaml) | `EXECUTE` on one routine, `CREATE`/`DROP`/`EXECUTE`/`SHOW` on a whole routine schema, `DENY` on one routine, `ALLOW_WITH_GRANT_OPTION` for a view owner. |
 | [`remove.biac.yaml`](examples/remove.biac.yaml) | The `remove:` section: replace a column-level grant (create the new one, delete the old one), grants and location grants, detach a mask / filter with `delete_expression`, take a role away from a user and a group, delete a whole role. |
 | [`data-products-ai-ui.biac.yaml`](examples/data-products-ai-ui.biac.yaml) | Data products (whole domain, one product, publisher actions incl. `PUBLISH`), AI models (`allEntities: true`), UI features (`QUERY_EDITOR`, `CATALOG_EXPLORER`, `DATA_PRODUCTS`, `AI_MODELS`). |
+| [`admin-and-other.biac.yaml`](examples/admin-and-other.biac.yaml) | The other categories, with the `allow_admin_privileges` opt-ins: roles, users (`IMPERSONATE`), mask / filter expressions, queries, system information, audit logs, session / schema / table properties, procedures, table branches, `tableType` / `tableBranch` on tables, agent skills, MCP servers, AI models by name, and the `APPLY_*` effects. |
 
 ```bash
 python3 biac_deploy.py --config examples/column-masks.biac.yaml --validate              # offline
@@ -154,19 +165,101 @@ uses `tpch` and assigns `demo_*` accounts). `remove.biac.yaml` is a catalogue
 of removal entries: `--dry-run` it, it is not a policy to apply. The others reference placeholder
 catalogs (`lakehouse`, `postgres`), groups and routines: adapt the names first.
 
-Actions used in the examples, by category (all applied on SEP 482-e lab
-clusters):
+## Entity categories
 
-| Category | Actions |
-|---|---|
-| `TABLES` | `SELECT`, `SHOW`, `CREATE`, `DROP`, `INSERT`, `DELETE`, `REFRESH` (materialized views) |
-| `FUNCTIONS` | `EXECUTE`, `CREATE`, `DROP`, `SHOW` |
-| `DATA_PRODUCTS` | `SHOW`, `CREATE`, `ALTER`, `DROP`, `PUBLISH` |
-| `AI_MODELS` | `EXECUTE` |
-| `USER_INTERFACE` | `SHOW` |
+Every category of the SEP built-in access control that concerns the engine is
+supported. Attributes not listed for a category are refused (`unknown attribute`),
+every value must be a non-empty string (never `'*'`), and the action of a grant
+is checked offline against the category's list (exit code 2, with the allowed
+list). Sources: the SEP privileges page and the SEP REST API reference (schemas
+`EntityModel` and its `*EntityData` variants); `GET
+/api/v1/biac/entityCategories/{category}/actions` on a cluster is the
+authoritative action list.
 
-The validator does not check action names: a misspelt action is only caught
-by the BIAC API, during `--apply`.
+| Category | Attributes (`—` = none) | Actions | Notes |
+|---|---|---|---|
+| `TABLES` | `catalog` (required), `schema`, `table`, `tableBranch`, `tableType` (`TABLE`/`VIEW`/`MATERIALIZED_VIEW`), `columns` | `ALTER` `CREATE` `DELETE` `DROP` `INSERT` `REFRESH` `SELECT` `SHOW` `UPDATE` | `tableType` splits `CREATE` per kind; `tableBranch` scopes data access to a branch |
+| `TABLE_BRANCHES` | `catalog` (required), `schema`, `table`, `branch` | `ALTER` `CREATE` `DROP` `SHOW` | `ALTER` = fast-forward |
+| `FUNCTIONS` | `catalog` (required), `schema`, `function` | `CREATE` `DROP` `EXECUTE` `SHOW` | |
+| `PROCEDURES` | `catalog` (required), `schema`, `procedure` | `EXECUTE` | `CALL` of catalog procedures |
+| `SCHEMA_PROPERTIES` | `catalog` (required), `schema`, `property`, `value` | `SET` | `value` needs `property` |
+| `TABLE_PROPERTIES` | `catalog` (required), `schema`, `table`, `property`, `value` | `SET` | |
+| `CATALOG_SESSION_PROPERTIES` | `catalog` (required), `entityKey` (the property) | `SET` | no `entityKey` = every property of the catalog |
+| `SYSTEM_SESSION_PROPERTIES` | `entityKey` or `allEntities: true` | `SET` | |
+| `ROLES` | `entityKey` or `allEntities: true` | `CREATE` `DROP` `SHOW` | admin; never `sysadmin` / `public` |
+| `USERS` | `entityKey` or `allEntities: true` | `IMPERSONATE` | admin; a named user must be in `allowed_users` |
+| `QUERIES` | — | `EXECUTE` `KILL` `SHOW` | `KILL` is admin |
+| `SYSTEM_INFORMATION` | — | `READ` `WRITE` | admin |
+| `AUDIT_LOGS` | — | `READ` | admin; action list **unverified** |
+| `COLUMN_MASK_EXPRESSIONS` | `entityKey` (expression name) or `allEntities: true` | `ALTER` `CREATE` `DROP` `SHOW` | admin |
+| `ROW_FILTER_EXPRESSIONS` | `entityKey` or `allEntities: true` | `ALTER` `CREATE` `DROP` `SHOW` | admin |
+| `DATA_PRODUCTS` | `domainName`, `dataProductName` | `ALTER` `CREATE` `DROP` `PUBLISH` `SHOW` | no `domainName` = all (admin opt-in) |
+| `USER_INTERFACE` | `uiFeature` (`QUERY_EDITOR`, `EXPORT_DATA`, `DATA_PRODUCTS`, `DATA_PRODUCTS_SHARING`, `DATA_PRODUCTS_AS_CODE`, `CATALOG_EXPLORER`, `OVERVIEW`, `QUERIES`, `CLUSTER_HISTORY`, `USAGE_METRICS`, `SPARK_RUNTIME`, `SPARK_MANAGEMENT`, `SQL_JOBS`, `AI_MODELS`, `SETTINGS`, `SETTINGS_LICENSE`, `SETTINGS_LOGIN`, `SCHEMA_DISCOVERY`, `S3_GOVERNANCE`, `OBJECT_STORES`, `EMULATED_CREDENTIALS`) | `SHOW` | no `uiFeature` = all features (admin opt-in) |
+| `AI_MODELS` | `entityKey` or `allEntities: true` | `CREATE` `DROP` `EXECUTE` `UPDATE` | `allEntities: true` stays open without opt-in (the form the SEP UI emits) |
+| `AGENT_SKILLS` | `entityKey` or `allEntities: true` | `CREATE` `DROP` `UPDATE` `USE` | all = admin opt-in |
+| `EXTERNAL_MCP_SERVERS` | `entityKey` or `allEntities: true` | `USE` | all = admin opt-in |
+
+Actions applied on SEP 482-e lab clusters so far: `TABLES` (`SELECT`, `SHOW`,
+`CREATE`, `DROP`, `ALTER`, `INSERT`, `UPDATE`, `DELETE`, `REFRESH`), `FUNCTIONS`
+(`EXECUTE`, `CREATE`, `DROP`, `SHOW`), `DATA_PRODUCTS` (`SHOW`, `CREATE`, `ALTER`,
+`DROP`, `PUBLISH`), `AI_MODELS` (`EXECUTE`), `USER_INTERFACE` (`SHOW`). Everything
+else in the table comes from the documentation only: see "To confirm on a lab".
+
+### How "all entities" is written
+
+The BIAC API has two ways to say "all": omit an attribute ("if empty it applies
+to all"), or `allEntities: true`. The two are not interchangeable, so each
+category has one rule, and the other form is refused:
+
+- **Catalog-rooted categories** (`TABLES`, `TABLE_BRANCHES`, `FUNCTIONS`,
+  `PROCEDURES`, `*_PROPERTIES`, `CATALOG_SESSION_PROPERTIES`): omit the narrower
+  attributes (`catalog` alone = the whole catalog, then `allow_catalog_wide` applies
+  to an `ALLOW`). `allEntities` is refused and the catalog is always required.
+  A narrow attribute needs its parent (`table` needs `schema`, `tableBranch` and
+  `columns` need `table`, `branch` needs `table`, `value` needs `property`).
+- **Categories with an `entityKey`** (`ROLES`, `USERS`, the two `*_EXPRESSIONS`,
+  `SYSTEM_SESSION_PROPERTIES`, `AI_MODELS`, `AGENT_SKILLS`, `EXTERNAL_MCP_SERVERS`):
+  name the key, or write `allEntities: true`. Omitting both is refused as
+  ambiguous (the API reference reads "empty = all", the SEP UI emits `allEntities`).
+- **`QUERIES`, `AUDIT_LOGS`, `SYSTEM_INFORMATION`**: no attribute. `allEntities:
+  true` may be written or omitted; the tool sends `{category, allEntities: true}`
+  and compares both forms as equal (to confirm on a lab).
+- **`DATA_PRODUCTS`, `USER_INTERFACE`**: omit `domainName` / `uiFeature` for "all";
+  `allEntities` is refused.
+
+An empty string is refused too (it does not reliably work, see "Security notes").
+
+### `APPLY_*` effects
+
+Besides `ALLOW`, `DENY` and `ALLOW_WITH_GRANT_OPTION`, a grant may carry
+`APPLY_COLUMN_MASK`, `APPLY_COLUMN_MASK_WITH_GRANT_OPTION`, `APPLY_ROW_FILTER` or
+`APPLY_ROW_FILTER_WITH_GRANT_OPTION` (the API's `columnMaskExpressionId` /
+`rowFilterExpressionId`). The expression is named, not numbered:
+
+```yaml
+grants:
+  - {role: r, effect: APPLY_COLUMN_MASK, action: SELECT, column_mask: mask_name, entity: {category: TABLES, catalog: c, schema: s, table: t, columns: [name]}}
+  - {role: r, effect: APPLY_ROW_FILTER, action: SELECT, row_filter: filter_name, entity: {category: TABLES, catalog: c, schema: s, table: t}}
+```
+
+- `column_mask` / `row_filter` is required for the matching effect and refused
+  for any other. The name is resolved to the expression id at plan time: the
+  expression must exist on the cluster or be declared under `column_masks` /
+  `row_filters` in the same file (then the grant is created after it), otherwise
+  the plan fails (exit code 2, nothing written).
+- Entity `TABLES` only, action `SELECT` only. The entity follows the mask / filter
+  rules: a mask needs `table` and `columns`, a filter needs `table` and no `columns`.
+- A grant's identity for idempotency (`SKIP` / `CREATE`) and for `remove:` includes
+  the expression id: the same entity with another expression is another grant.
+- In the plan and in `--apply` these grants are the kind `apply_grant`, after the
+  row-filter attachments (they need both kinds of expressions to exist).
+- `remove.grants` accepts the same entries: an unknown expression name is
+  `SKIP (absent)`.
+- `APPLY_*_WITH_GRANT_OPTION` is a widening effect: it needs the admin opt-in of
+  its expressions (`COLUMN_MASK_EXPRESSIONS` / `ROW_FILTER_EXPRESSIONS`).
+
+The validator does check the action names now; the BIAC API remains the last
+judge during `--apply`.
 
 **Style convention — keep every grant on one flow-style line**, even when
 `action` is a list:
@@ -186,16 +279,16 @@ roles:
 
 grants:
   - role: <role name declared above>
-    effect: ALLOW | DENY | ALLOW_WITH_GRANT_OPTION
-    action: SELECT | EXECUTE | INSERT | ...   # or a list: [SELECT, INSERT, ...]
-    entity:
-      category: TABLES | FUNCTIONS
+    effect: ALLOW | DENY | ALLOW_WITH_GRANT_OPTION | APPLY_COLUMN_MASK[_WITH_GRANT_OPTION] | APPLY_ROW_FILTER[_WITH_GRANT_OPTION]
+    action: SELECT | EXECUTE | INSERT | ...   # or a list: [SELECT, INSERT, ...]; checked per category
+    column_mask: <expression name>   # APPLY_COLUMN_MASK* only (row_filter: for APPLY_ROW_FILTER*)
+    entity:                          # TABLES and FUNCTIONS below; the other categories: see "Entity categories"
+      category: TABLES | FUNCTIONS | ...
       catalog: <catalog>
       schema: <schema>      # omit entirely for a catalog-wide grant
       table: <table>        # TABLES only — omit for a schema-wide grant
       function: <function>  # FUNCTIONS only — omit for a schema-wide grant
-      columns: [<column>, ...]  # optional: column-level grant (use with TABLES + table;
-                                # the validator does not check this)
+      columns: [<column>, ...]  # optional: column-level grant (TABLES; needs `table`)
 
 location_grants:
   - role: <role name declared above>
@@ -242,6 +335,7 @@ remove:                          # optional, see "Removing entitlements (`remove
 allowed_users: [<username>, ...]
 allowed_groups: [<groupname>, ...]
 allow_catalog_wide: [<catalog>, ...]
+allow_admin_privileges: [<CATEGORY or CATEGORY:ACTION>, ...]
 ```
 
 ## Removing entitlements (`remove:`)
@@ -291,7 +385,7 @@ the `yes` prompt (`--apply --plan` prints it too, there is no prompt).
 
 | Entry | An object matches when |
 |---|---|
-| `grants` | same role, same `effect`, same `action` (one match per action of a list) and the same entity: category, catalog, schema, table or function, and the **sorted, lowercased `columns`** (so `[b, a]` matches `[A, B]`, but `[a]` does not match `[a, b]`) |
+| `grants` | same role, same `effect`, same `action` (one match per action of a list) and the same entity: category and every attribute of the category (catalog, schema, table, function, `entityKey`, ...; a user name keeps its case), and the **sorted, lowercased `columns`** (so `[b, a]` matches `[A, B]`, but `[a]` does not match `[a, b]`); for an `APPLY_*` grant, also the same expression (`column_mask` / `row_filter` name, compared by id) |
 | `location_grants` | same role, same `location`, same `grant_option` (default false) |
 | `column_masks` / `row_filters` | the expression `name` is attached to the role on the same entity. `expression` and `description` are not compared. An unknown expression name, or a role that does not exist, is `SKIP (absent)` |
 | `assignments` | the role is assigned to that user / group |
@@ -354,8 +448,11 @@ added or an object that has disappeared since.
   legacy) but must match `^[a-z0-9_]+$`;
 - users / groups of `remove.assignments` must be in `allowed_users` /
   `allowed_groups`;
-- entities follow the creation rules (no `'*'`, no `allEntities: true`, a
-  `table` for masks and filters, `columns` for masks).
+- grants follow the creation rules (effect, per-category action matrix, entity
+  attributes, `column_mask` / `row_filter` for `APPLY_*`), minus the admin
+  opt-in (a removal never widens): every category can be removed;
+- mask / filter entries: `TABLES` only, a `table` for masks and filters,
+  `columns` for masks.
 
 ### `--verify`
 
@@ -372,7 +469,9 @@ These checks run before any network call, in every mode (`--dry-run`,
 |---|---|
 | No `sysadmin` / `public` | A role named `sysadmin` or `public` (any case) cannot be declared, nor be the target of a grant, location grant, column mask, row filter or assignment. |
 | `allowed_users` / `allowed_groups` | Every user (resp. group) in `assignments` must be listed in the root `allowed_users` (resp. `allowed_groups`) of the same file. A missing key means an empty list: any assignment is then refused. Exact, case-sensitive match. The file thus names the accounts it may touch (demo accounts, in the lab). |
-| `allow_catalog_wide` | An `ALLOW` or `ALLOW_WITH_GRANT_OPTION` on a TABLES/FUNCTIONS entity **without `schema`** (whole catalog) is refused unless its catalog is listed in the root `allow_catalog_wide` (case-insensitive, per catalog). `DENY` and schema-scoped grants are not affected. |
+| `allow_catalog_wide` | A widening grant on a catalog-rooted entity (`TABLES`, `TABLE_BRANCHES`, `FUNCTIONS`, `PROCEDURES`, `SCHEMA_PROPERTIES`, `TABLE_PROPERTIES`; `CATALOG_SESSION_PROPERTIES` without `entityKey`) **without `schema`** (whole catalog) is refused unless its catalog is listed in the root `allow_catalog_wide` (case-insensitive, per catalog). `DENY` and schema-scoped grants are not affected. |
+| `allow_admin_privileges` | A widening grant (`ALLOW`, `ALLOW_WITH_GRANT_OPTION`, `APPLY_*_WITH_GRANT_OPTION`) on an administrative category or on an "all" form is refused unless the root `allow_admin_privileges` lists the category (`ROLES`) or one action of it (`QUERIES:KILL`). Administrative: `ROLES`, `USERS`, `SYSTEM_INFORMATION`, `AUDIT_LOGS`, `COLUMN_MASK_EXPRESSIONS`, `ROW_FILTER_EXPRESSIONS` (every action) and `QUERIES:KILL`. "All" forms: `allEntities: true` on `AGENT_SKILLS`, `EXTERNAL_MCP_SERVERS`, `SYSTEM_SESSION_PROPERTIES`, and `DATA_PRODUCTS` without `domainName` / `USER_INTERFACE` without `uiFeature` (the category lists it). `AI_MODELS` with `allEntities: true` stays open, for backward compatibility. `APPLY_*_WITH_GRANT_OPTION` needs its expression category (`COLUMN_MASK_EXPRESSIONS` / `ROW_FILTER_EXPRESSIONS`). `DENY` never needs an opt-in, nor does a removal. A token that is not a supported `CATEGORY` / `CATEGORY:ACTION` is itself an error. A missing key means an empty list (fail closed). |
+| `USERS` targets | The named user of a widening `IMPERSONATE` grant must be listed in the root `allowed_users`, like an assignment; a `ROLES` grant never names `sysadmin` / `public`. |
 | `remove:` | The same guardrails apply to removals (see "Removing entitlements"): no `sysadmin` / `public`, accounts declared in `allowed_users` / `allowed_groups`, no object both created and removed, unknown keys refused. |
 | Expression name length | A `column_masks` / `row_filters` entry whose `name` is longer than 30 characters is refused, with the name and its length (BIAC API limit observed on SEP 482-e: `name: value may not be more than 30 characters`; it otherwise fails midway through `--apply`). Descriptions are capped at 250 characters. Role names: no limit documented or observed, so none is enforced. |
 
@@ -380,6 +479,7 @@ These checks run before any network call, in every mode (`--dry-run`,
 allowed_users: [demo]
 allowed_groups: [demo_dp_readers]
 allow_catalog_wide: [tpch]      # opt-in, explicit, one catalog at a time
+allow_admin_privileges: [ROLES, QUERIES:KILL]   # opt-in for administrative grants (see the table above)
 ```
 
 ## Catalog-wide and schema-wide grants
@@ -394,12 +494,14 @@ entity: {category: TABLES, catalog: my_catalog}                  # catalog.*
 entity: {category: TABLES, catalog: my_catalog, schema: my_schema} # catalog.schema.*
 ```
 
-Non-data entities (grants only — masks and row filters accept TABLES only):
+Other entities (grants only — masks and row filters accept TABLES only; see
+"Entity categories" for all of them):
 
 ```yaml
 entity: {category: DATA_PRODUCTS, domainName: CIB}                          # every DP of domain CIB
 entity: {category: DATA_PRODUCTS, domainName: CIB, dataProductName: my_dp}  # one DP
-entity: {category: AI_MODELS, allEntities: true}                            # all AI models (only allowed form)
+entity: {category: AI_MODELS, entityKey: my_model}                          # one AI model
+entity: {category: AI_MODELS, allEntities: true}                            # all AI models
 entity: {category: USER_INTERFACE, uiFeature: AI_MODELS}                    # UI feature (QUERY_EDITOR, DATA_PRODUCTS…)
 ```
 
@@ -434,12 +536,14 @@ Observed on a lab cluster (SEP 482-e, 2026-11-16), with secure views:
 
 ## Security notes
 
-- `allEntities: true` is rejected by this tool at validation time — every
-  entity must name its catalog (and, narrower, schema/table or
-  schema/function) explicitly, or use the catalog/schema-wide omission
-  above. This is deliberate: `allEntities: true` combined with any other
-  attribute is invalid per the BIAC API, and broad grants are a common
-  source of over-permissioning.
+- `allEntities: true` is rejected by this tool on the catalog-rooted
+  categories (`TABLES`, `FUNCTIONS`, ...) — every such entity must name its
+  catalog (and, narrower, schema/table or schema/function) explicitly, or use
+  the catalog/schema-wide omission above. This is deliberate: `allEntities:
+  true` combined with any other attribute is invalid per the BIAC API, and
+  broad grants are a common source of over-permissioning. On the categories
+  with an `entityKey` and on the global ones it is the way to say "all", and an
+  "all" or administrative widening grant needs `allow_admin_privileges`.
 - An EMPTY string for schema/table (as opposed to omitting the field) does
   NOT reliably work (confirmed on a demo cluster — `PERMISSION_DENIED` despite
   the grant existing). Use an explicit per-table grant, or omit the field
@@ -465,6 +569,41 @@ Observed on a lab cluster (SEP 482-e, 2026-11-16), with secure views:
   and errors are printed as a short message, never as a traceback.
 - Writes require the `sysadmin` BIAC role (or an equivalent BIAC admin
   role) on the connecting user — set via the `X-Trino-Role` header.
+
+## To confirm on a lab
+
+Written from the documentation and the API reference, never applied on a cluster
+yet. Each point has a safe default in the code; the lab check decides.
+
+1. **Actions per category.** Only the actions listed under "Actions applied on SEP
+   482-e lab clusters" are proven. Compare every row of the "Entity categories"
+   table with `GET /api/v1/biac/entityCategories/{category}/actions`; the matrix
+   is one tuple per category in `biac/categories.py`.
+2. **`AUDIT_LOGS`** has no action list on the privileges page nor in the API
+   reference: `READ` is a guess.
+3. **Data access on a table branch.** The privileges page lists `SELECT`, `INSERT`,
+   `UPDATE`, `DELETE` "on a branch"; the API reference has a `tableBranch`
+   attribute on `TABLES` and a separate `TABLE_BRANCHES` category (`branch`).
+   Supported: `TABLES` + `tableBranch`. `TABLE_BRANCHES` accepts only `ALTER`,
+   `CREATE`, `DROP`, `SHOW`; widen it if the cluster lists data actions there.
+4. **Global categories** (`QUERIES`, `AUDIT_LOGS`, `SYSTEM_INFORMATION`): sent as
+   `{category, allEntities: true}`. If the API refuses it, set
+   `GLOBAL_SENDS_ALL_ENTITIES = False` in `biac/categories.py` and compare the
+   read-back.
+5. **"All" of a keyed category** is `allEntities: true` (omitting `entityKey` is
+   refused). Check the read-back is the same form, so a second run is `SKIP`.
+6. **"All" of `DATA_PRODUCTS` / `USER_INTERFACE`** by omission (no `domainName` /
+   `uiFeature`).
+7. **`APPLY_*` grants**: that the API accepts a `TABLES` entity with `table` (and
+   `columns` for a mask) and `columnMaskExpressionId` / `rowFilterExpressionId`,
+   that `GET .../grants` returns the id (the identity of the grant relies on it),
+   and how they relate to the `columnMasks` / `rowFilters` attachments.
+8. **Case of the new attributes**: `entityKey` (except user names, compared as
+   written), `branch`, `property`, `value`, `procedure` are compared
+   case-insensitively; confirm the API lowercases (or keeps) them like
+   catalog/schema/table names.
+9. **Assignment ids** used by `remove.assignments`: `GET /subjects/{users|groups}/{name}/assignments`
+   against `GET /roles/{id}/assignments` (same ids?), see "Removing entitlements".
 
 ## Known limitation
 

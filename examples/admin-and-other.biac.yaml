@@ -1,0 +1,117 @@
+# Every other entity category: administrative privileges, session and object properties, procedures,
+# table branches, queries, agent skills, MCP servers, APPLY_* effects. Generic, no customer data.
+#
+#   python3 biac_deploy.py --config examples/admin-and-other.biac.yaml --validate
+#
+# Validate or --dry-run this file; do not apply it as is (the names are placeholders).
+#
+# How "all entities" is written depends on the category (see the README, "Entity categories"):
+#   - catalog-rooted categories (TABLES, TABLE_BRANCHES, FUNCTIONS, PROCEDURES, *_PROPERTIES,
+#     CATALOG_SESSION_PROPERTIES): omit the narrower attribute(s); `allEntities` is refused, and a
+#     catalog-wide ALLOW needs `allow_catalog_wide`;
+#   - categories with an `entityKey` (ROLES, USERS, *_EXPRESSIONS, SYSTEM_SESSION_PROPERTIES, AI_MODELS,
+#     AGENT_SKILLS, EXTERNAL_MCP_SERVERS): name the key, or write `allEntities: true`; omitting both is refused;
+#   - QUERIES, AUDIT_LOGS, SYSTEM_INFORMATION have no attribute at all;
+#   - DATA_PRODUCTS and USER_INTERFACE: omit `domainName` / `uiFeature` for "all".
+#
+# A widening grant (ALLOW / ALLOW_WITH_GRANT_OPTION / APPLY_*_WITH_GRANT_OPTION) on an administrative
+# category or on an "all" form is refused unless the root key `allow_admin_privileges` lists it: the
+# category (e.g. ROLES) or CATEGORY:ACTION (e.g. QUERIES:KILL). DENY never needs it.
+# Each opt-in below sits next to the grant it covers.
+
+allow_admin_privileges:
+  - ROLES                  # the role below may create / drop / show roles
+  - USERS:IMPERSONATE      # ... and impersonate the named user
+  - QUERIES:KILL           # only KILL is administrative; EXECUTE and SHOW on QUERIES need no opt-in
+  - SYSTEM_INFORMATION:READ
+  - COLUMN_MASK_EXPRESSIONS
+  - ROW_FILTER_EXPRESSIONS
+  - AGENT_SKILLS           # for the `allEntities: true` form only; a named skill needs no opt-in
+  - USER_INTERFACE         # for the "all features" form only
+allowed_users: [demo]      # a user named by an IMPERSONATE grant must be listed here, like an assignment
+allowed_groups: [ex_admins]
+allow_catalog_wide: [ice]  # SET on every property of a catalog is as wide as a catalog-wide grant
+
+roles:
+  - name: ex_platform_admin   # administrative privileges
+  - name: ex_engineer         # properties, procedures, branches, session properties
+  - name: ex_support          # queries and system information
+  - name: ex_ai_agent         # agent skills, MCP servers, AI models
+  - name: ex_delegate         # may apply the mask / filter below (APPLY_* effects)
+
+# Expressions referenced by the APPLY_* grants below: declared here, or already on the cluster.
+column_masks:
+  - name: ex_mask_name
+    description: Hides the name
+    expression: "'***'"
+    role: ex_delegate
+    entity: {category: TABLES, catalog: tpch, schema: tiny, table: customer, columns: [name]}
+row_filters:
+  - name: ex_filter_europe
+    description: Rows of region 3 only
+    expression: "regionkey = 3"
+    role: ex_delegate
+    entity: {category: TABLES, catalog: tpch, schema: tiny, table: nation}
+
+grants:
+  # --- administrative: ROLES (entityKey = one role, or allEntities: true; never sysadmin / public) ---
+  - {role: ex_platform_admin, effect: ALLOW, action: [CREATE, DROP, SHOW], entity: {category: ROLES, entityKey: ex_engineer}}
+  - {role: ex_platform_admin, effect: ALLOW, action: SHOW, entity: {category: ROLES, allEntities: true}}
+  # --- USERS: IMPERSONATE one named user (case-sensitive, must be in allowed_users) ---
+  - {role: ex_platform_admin, effect: ALLOW, action: IMPERSONATE, entity: {category: USERS, entityKey: demo}}
+  # DENY is always free: nobody holding this role may impersonate anyone else
+  - {role: ex_engineer, effect: DENY, action: IMPERSONATE, entity: {category: USERS, allEntities: true}}
+  # --- expressions: who may create / alter / drop / show masks and filters ---
+  - {role: ex_platform_admin, effect: ALLOW, action: [CREATE, ALTER, DROP, SHOW], entity: {category: COLUMN_MASK_EXPRESSIONS, allEntities: true}}
+  - {role: ex_platform_admin, effect: ALLOW, action: SHOW, entity: {category: ROW_FILTER_EXPRESSIONS, entityKey: ex_filter_europe}}
+
+  # --- queries and system information (no attribute) ---
+  - {role: ex_support, effect: ALLOW, action: [EXECUTE, SHOW], entity: {category: QUERIES}}
+  - {role: ex_support, effect: ALLOW, action: KILL, entity: {category: QUERIES, allEntities: true}}
+  - {role: ex_support, effect: ALLOW, action: READ, entity: {category: SYSTEM_INFORMATION}}
+  - {role: ex_engineer, effect: DENY, action: WRITE, entity: {category: SYSTEM_INFORMATION}}   # graceful shutdown
+  # AUDIT_LOGS: READ is a guess, not on the privileges page (README, "To confirm on a lab"); denying is safe:
+  - {role: ex_engineer, effect: DENY, action: READ, entity: {category: AUDIT_LOGS}}
+
+  # --- properties: SET ---
+  - {role: ex_engineer, effect: ALLOW, action: SET, entity: {category: SYSTEM_SESSION_PROPERTIES, entityKey: query_max_run_time}}
+  - {role: ex_engineer, effect: ALLOW, action: SET, entity: {category: CATALOG_SESSION_PROPERTIES, catalog: ice, entityKey: compression_codec}}
+  - {role: ex_engineer, effect: ALLOW, action: SET, entity: {category: CATALOG_SESSION_PROPERTIES, catalog: ice}}   # every property of ice (allow_catalog_wide)
+  - {role: ex_engineer, effect: ALLOW, action: SET, entity: {category: SCHEMA_PROPERTIES, catalog: ice, schema: staging, property: location}}
+  - {role: ex_engineer, effect: ALLOW, action: SET, entity: {category: TABLE_PROPERTIES, catalog: ice, schema: staging, table: events, property: format, value: PARQUET}}
+
+  # --- procedures: catalog > schema > procedure (CALL), omit the tail for "all of the schema" ---
+  - {role: ex_engineer, effect: ALLOW, action: EXECUTE, entity: {category: PROCEDURES, catalog: ice, schema: system, procedure: rollback_to_snapshot}}
+  - {role: ex_engineer, effect: ALLOW, action: EXECUTE, entity: {category: PROCEDURES, catalog: ice, schema: system}}
+
+  # --- table branches (Iceberg): omit `branch` for every branch of the table ---
+  - {role: ex_engineer, effect: ALLOW, action: [CREATE, SHOW], entity: {category: TABLE_BRANCHES, catalog: ice, schema: staging, table: events}}
+  - {role: ex_engineer, effect: ALLOW, action: [ALTER, DROP], entity: {category: TABLE_BRANCHES, catalog: ice, schema: staging, table: events, branch: dev}}
+
+  # --- TABLES: the attributes tableType (split CREATE per kind) and tableBranch (data access on a branch) ---
+  - {role: ex_engineer, effect: ALLOW, action: CREATE, entity: {category: TABLES, catalog: ice, schema: staging, tableType: VIEW}}
+  - {role: ex_engineer, effect: ALLOW, action: [SELECT, INSERT], entity: {category: TABLES, catalog: ice, schema: staging, table: events, tableBranch: dev}}
+
+  # --- agent skills, external MCP servers, AI models: a named entity needs no opt-in ---
+  - {role: ex_ai_agent, effect: ALLOW, action: USE, entity: {category: AGENT_SKILLS, entityKey: sales_summary}}
+  - {role: ex_ai_agent, effect: ALLOW, action: USE, entity: {category: AGENT_SKILLS, allEntities: true}}   # all skills: opt-in AGENT_SKILLS
+  - {role: ex_ai_agent, effect: ALLOW, action: USE, entity: {category: EXTERNAL_MCP_SERVERS, entityKey: crm}}
+  - {role: ex_ai_agent, effect: ALLOW, action: EXECUTE, entity: {category: AI_MODELS, entityKey: summariser}}
+  - {role: ex_ai_agent, effect: ALLOW, action: EXECUTE, entity: {category: AI_MODELS, allEntities: true}}   # kept open: the form the SEP UI emits
+
+  # --- the "all" forms of data products and UI features (opt-in USER_INTERFACE above; DATA_PRODUCTS
+  #     without domainName would need DATA_PRODUCTS) ---
+  - {role: ex_platform_admin, effect: ALLOW, action: SHOW, entity: {category: USER_INTERFACE}}
+  - {role: ex_ai_agent, effect: ALLOW, action: SHOW, entity: {category: USER_INTERFACE, uiFeature: AI_MODELS}}
+
+  # --- APPLY_* effects: apply a mask / filter. `column_mask` / `row_filter` names the expression (resolved
+  #     to its id at plan time: it must exist on the cluster or be declared above, else the plan fails).
+  #     TABLES only, action SELECT only; the mask needs `columns`, the filter must not have any.
+  #     `_WITH_GRANT_OPTION` lets the role delegate it: a widening effect, covered by the opt-in
+  #     COLUMN_MASK_EXPRESSIONS / ROW_FILTER_EXPRESSIONS (listed at the top). ---
+  - {role: ex_delegate, effect: APPLY_COLUMN_MASK, action: SELECT, column_mask: ex_mask_name, entity: {category: TABLES, catalog: tpch, schema: tiny, table: customer, columns: [name]}}
+  - {role: ex_delegate, effect: APPLY_ROW_FILTER, action: SELECT, row_filter: ex_filter_europe, entity: {category: TABLES, catalog: tpch, schema: tiny, table: nation}}
+  - {role: ex_delegate, effect: APPLY_ROW_FILTER_WITH_GRANT_OPTION, action: SELECT, row_filter: ex_filter_europe, entity: {category: TABLES, catalog: tpch, schema: tiny, table: orders}}
+
+assignments:
+  - {role: ex_platform_admin, groups: [ex_admins]}
