@@ -6,38 +6,28 @@ declarative YAML file, via the BIAC REST API.
 
 ## Structure
 
-One folder per cluster/environment under `environments/`:
-
 ```
-environments/
-  demo-lab/
-    views.sql   # schema + view/table creation for this cluster
-    biac.yaml   # roles/grants/masks/filters/assignments for this cluster
-  staging/
-    views.sql
-    perimeter-perimetre.sql  # extra SQL file: RLS perimeter mapping table
-    biac.yaml
+biac_deploy.py            # the tool (single file, PyYAML only)
+examples/sample.biac.yaml # generic, commented policy on the built-in tpch catalog
+tests/                    # offline unit tests (simulated BIAC client)
 ```
 
-An environment folder isn't limited to exactly `views.sql` + `biac.yaml` —
-add further `.sql` files for any extra schema/table that `biac.yaml`'s
-grants/row_filters reference, as staging does above.
+**This repository holds no customer policy.** Real policy files live with the
+project they belong to (one `<name>.biac.yaml` per cluster and use case, next to
+the SQL that creates the views they target) and are passed with `--config`.
+Several policy files can target the same cluster: each is planned and applied
+on its own.
 
-Catalog/schema/table names are hardcoded in each environment's files — there
-is no cross-environment templating. To reproduce a policy on a new cluster,
-copy the folder and edit both files:
-
-```bash
-cp -r environments/demo-lab environments/acme-prod
-# then edit environments/acme-prod/views.sql and biac.yaml with the real
-# catalog/schema/table names on that cluster
-```
+Catalog/schema/table names are hardcoded in each policy file — there is no
+templating. To reproduce a policy on another cluster, copy the file and edit
+the names.
 
 ## Scope (v1)
 
 - ✅ Roles
-- ✅ Grants (tables/functions, data products, AI models, UI features)
-- ✅ Location grants (`location_grants`, endpoint séparé `/locationGrants`)
+- ✅ Grants (tables/functions, data products, AI models, UI features),
+  including column-level `SELECT` grants (`entity.columns`)
+- ✅ Location grants (`location_grants`, separate endpoint `/locationGrants`)
 - ✅ Column masks (CLS)
 - ✅ Row filters (RLS)
 - ✅ Assignments (user/group → role)
@@ -66,24 +56,24 @@ cp -r environments/demo-lab environments/acme-prod
 
 1. Copy `.env.example` to `.env.<cluster-name>` and fill in real
    credentials. **Never commit this file** — it's gitignored.
-2. Run `environments/<name>/views.sql` on the target cluster first (Trino
-   CLI, or any client with `sysadmin`/schema-creation rights) — the grants
-   and masks in `biac.yaml` target the views/tables it creates.
+2. Create the schemas/views the policy targets on the cluster first (Trino
+   CLI, or any client with schema-creation rights): grants, masks and filters
+   reference existing objects.
 
 ## Usage
 
 ```bash
 # 1. See what would change, without touching the cluster
-python3 biac_deploy.py --env .env.lab --config environments/demo-lab/biac.yaml --dry-run
+python3 biac_deploy.py --env .env.mycluster --config examples/sample.biac.yaml --dry-run
 
 # 2. Apply — prompts for confirmation before any write
-python3 biac_deploy.py --env .env.lab --config environments/demo-lab/biac.yaml --apply
+python3 biac_deploy.py --env .env.mycluster --config examples/sample.biac.yaml --apply
 
 # 3. Read back the current state of everything declared in the config
-python3 biac_deploy.py --env .env.lab --config environments/demo-lab/biac.yaml --verify
+python3 biac_deploy.py --env .env.mycluster --config examples/sample.biac.yaml --verify
 
 # 4. Offline: validator + guardrails only (no --env, no network)
-python3 biac_deploy.py --config environments/demo-lab/biac.yaml --validate
+python3 biac_deploy.py --config examples/sample.biac.yaml --validate
 ```
 
 The path of the credentials file is always given by `--env`; the script never
@@ -94,10 +84,10 @@ shown).
 
 ```bash
 # 1. Compute the plan, write it with its fingerprint (JSON, mode 0600)
-python3 biac_deploy.py --env .env.lab --config f.biac.yaml --dry-run --plan-out plan.json
+python3 biac_deploy.py --env .env.mycluster --config f.biac.yaml --dry-run --plan-out plan.json
 # 2. A human reads the plan (printed, and in plan.json)
 # 3. Apply: recomputes the plan against the live cluster, refuses if it differs. No prompt.
-python3 biac_deploy.py --env .env.lab --config f.biac.yaml --apply --plan plan.json
+python3 biac_deploy.py --env .env.mycluster --config f.biac.yaml --apply --plan plan.json
 ```
 
 The fingerprint is a SHA-256 over the canonical plan (sorted JSON), the exact
@@ -106,20 +96,21 @@ bytes of the YAML file (a comment is enough to change it) and the target
 was altered, if the YAML changed since the plan was made, if the cluster state
 changed (a role created meanwhile, etc.) or if the plan was made for another
 cluster. Exit codes: `0` ok, `1` runtime error / manual apply aborted,
-`2` invalid YAML or guardrail violation (or bad usage), `3` signed plan refused.
+`2` invalid YAML or guardrail violation (or bad usage), `3` signed plan refused,
+`4` `--apply` refused because the plan contains a `DRIFT (expression differs)`.
 `--plan-out` is only valid with `--dry-run`, `--plan` only with `--apply`.
 `--apply` without `--plan` keeps the interactive `yes` confirmation (manual use).
 
-## `biac.yaml` format
+## Policy file format (`*.biac.yaml`)
 
-See `environments/demo-lab/biac.yaml` for a complete, commented real example
-(the acme datahub `poc_profile_open` / `poc_profile_restricted` /
-`poc_profile_decrypt` policy).
+See `examples/sample.biac.yaml` for a complete, commented example (roles,
+schema-wide and column-level grants, a UI grant, a location grant, a column
+mask, a row filter, assignments and guardrails) on the built-in `tpch` catalog.
 
 **Style convention — keep every grant on one flow-style line**, even when
 `action` is a list:
 ```yaml
-- {role: poc_profile_open, effect: ALLOW, action: [CREATE, DELETE, SELECT], entity: {category: TABLES, catalog: iceberg}}
+- {role: sample_ops, effect: ALLOW, action: [CREATE, DELETE, SELECT], entity: {category: TABLES, catalog: iceberg}}
 ```
 Mixing flow-style (`{...}`) and block-style (one key per line) for the same
 kind of entry invites exactly the kind of broken-YAML edit this project hit
@@ -142,6 +133,13 @@ grants:
       schema: <schema>      # omit entirely for a catalog-wide grant
       table: <table>        # TABLES only — omit for a schema-wide grant
       function: <function>  # FUNCTIONS only — omit for a schema-wide grant
+      columns: [<column>, ...]  # optional: column-level grant (use with TABLES + table;
+                                # the validator does not check this)
+
+location_grants:
+  - role: <role name declared above>
+    location: s3://<bucket>/<prefix>/*   # full URI, bucket + path required
+    grant_option: false                  # optional, default false
 
 column_masks:
   - name: <expression name, unique>
@@ -204,8 +202,8 @@ one table, by **omitting** the narrower field(s) — not by setting them to
 `'*'` is rejected by this tool's validator):
 
 ```yaml
-entity: {category: TABLES, catalog: datahub}                  # catalog.*
-entity: {category: TABLES, catalog: datahub, schema: my_schema} # catalog.schema.*
+entity: {category: TABLES, catalog: my_catalog}                  # catalog.*
+entity: {category: TABLES, catalog: my_catalog, schema: my_schema} # catalog.schema.*
 ```
 
 Non-data entities (grants only — masks and row filters accept TABLES only):
@@ -220,6 +218,31 @@ entity: {category: USER_INTERFACE, uiFeature: AI_MODELS}                    # UI
 A column mask always targets one specific table (it masks specific
 columns), so `table` is required there regardless.
 
+## Column-level grants and column masks: behaviour
+
+Observed on a lab cluster (SEP 482-e, 2026-11-16), with secure views:
+
+- **A grant's identity includes its column list.** Idempotency compares
+  effect + action + entity, and the entity includes the sorted, lowercased
+  `columns`. Adding or removing a column in a column-level grant therefore
+  plans a **new** grant (`CREATE`); the old grant stays on the cluster.
+  Grants are cumulative `ALLOW`s: the old grant keeps giving access to its
+  columns, so **removing a column from the YAML does not revoke it**. Delete
+  the superseded grant through the API (see "Known limitation"), then check
+  that a `--dry-run` plans no `CREATE`.
+- **A mask expression may reference another column of the same row**
+  (e.g. expose `col_b`'s value in place of `col_a` for one role:
+  `expression: "col_b"` on `columns: [col_a]`).
+- **The mask is evaluated with the querying user's rights**: every column it
+  references must be granted to the masked role, or the query fails with
+  `Access Denied`, even though the mask, not the user, reads that column.
+- **Filters and joins on a masked column use the masked value.** A
+  `WHERE col_a = …` from a masked role matches the masked value, not the
+  stored one: the underlying value is not leaked through a predicate.
+- A role without a mask on the column sees the stored value, so one view
+  column can carry a different value per role without any `CASE` on roles in
+  the view.
+
 ## Security notes
 
 - `allEntities: true` is rejected by this tool at validation time — every
@@ -229,7 +252,7 @@ columns), so `table` is required there regardless.
   attribute is invalid per the BIAC API, and broad grants are a common
   source of over-permissioning.
 - An EMPTY string for schema/table (as opposed to omitting the field) does
-  NOT reliably work (confirmed on the acme demo — `PERMISSION_DENIED` despite
+  NOT reliably work (confirmed on a demo cluster — `PERMISSION_DENIED` despite
   the grant existing). Use an explicit per-table grant, or omit the field
   entirely for a real catalog/schema-wide grant (see above) — never `""`.
 - The script never deletes, revokes, or overwrites anything. Re-running it
@@ -256,6 +279,27 @@ cluster (the BIAC API treats a grant as the same object once action+entity
 match, regardless of effect, and rejects a second create with 409
 ALREADY_EXISTS). To change one, delete it directly via the BIAC API first
 (outside this tool), then re-run `--apply` to recreate it from the YAML.
+
+The same applies to a column-level grant whose column list changes: the new
+grant is created, the old one is not removed (see "Column-level grants and
+column masks: behaviour").
+
+Deletion routes used successfully on the lab (SEP 482-e, `sysadmin` role,
+not covered by this repo's documentation of the API; check the response
+status of each call):
+
+| Object | Route |
+|---|---|
+| Grant | `DELETE /api/v1/biac/roles/{roleId}/grants/{id}` |
+| Row filter / column mask attachment | `DELETE /api/v1/biac/roles/{roleId}/rowFilters/{id}` / `.../columnMasks/{id}` |
+| Location grant | `DELETE /api/v1/biac/roles/{roleId}/locationGrants/{id}` |
+| Assignment | `DELETE /api/v1/biac/subjects/{groups\|users}/{name}/assignments/{id}` |
+| Role (once empty) | `DELETE /api/v1/biac/roles/{roleId}` |
+| Orphan expression | `DELETE /api/v1/biac/expressions/{rowFilter\|columnMask}/{id}` |
+
+Ids come from the matching `GET` on the same path. In a user assignment the
+subject's name is under `username`. Delete with a dry-run first and re-read
+the state afterwards; never touch `sysadmin` / `public`.
 
 ## Tests
 

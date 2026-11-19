@@ -375,7 +375,7 @@ column_masks:
     entity: {category: TABLES, catalog: tpch, schema: tiny, table: nation, columns: [comment]}
 row_filters:
   - name: zz_filter
-    expression: "regionkey IN (SELECT perimetre FROM postgres.perimeter.perimeter_perimetre WHERE upn=current_user)"
+    expression: "regionkey IN (SELECT perimetre FROM postgres.security.user_perimeter WHERE upn=current_user)"
     role: zz_test_reader
     entity: {category: TABLES, catalog: tpch, schema: tiny, table: nation}
 """
@@ -417,20 +417,20 @@ class DriftTests(WorkDir):
         self.assertEqual({a for _, a in self.actions("column_mask_expression")}, {"SKIP (exists)"})
 
     def test_whitespace_only_difference_is_skip(self):
-        c = self.seeded(rf_text="regionkey   IN (SELECT perimetre FROM postgres.perimeter.perimeter_perimetre\n"
+        c = self.seeded(rf_text="regionkey   IN (SELECT perimetre FROM postgres.security.user_perimeter\n"
                                 "  WHERE upn=current_user) ")
         self.dry(c)
         self.assertEqual({a for _, a in self.actions("row_filter_expression")}, {"SKIP (exists)"})
 
     def test_row_filter_text_difference_is_drift_with_both_texts(self):
-        c = self.seeded(rf_text="regionkey IN (SELECT perimetre FROM iceberg.acme_parameter.perimeter WHERE upn=current_user)")
+        c = self.seeded(rf_text="regionkey IN (SELECT perimetre FROM iceberg.ref.user_perimeter_v2 WHERE upn=current_user)")
         rc, out, err = self.dry(c)
         self.assertEqual(rc, 0)
         (label, action), = self.actions("row_filter_expression")
         self.assertEqual(action, bd.DRIFT_ACTION)
         self.assertIn("zz_filter", label)
-        self.assertIn("iceberg.acme_parameter.perimeter", label)
-        self.assertIn("postgres.perimeter.perimeter_perimetre", label)
+        self.assertIn("iceberg.ref.user_perimeter_v2", label)
+        self.assertIn("postgres.security.user_perimeter", label)
         self.assertIn("DRIFT", err)  # warning on stderr, plan still written
         self.assertEqual(c.writes, 0)
 
@@ -602,7 +602,7 @@ class ExpressionNameLengthTests(unittest.TestCase):
         self.assertIn("30-char", errors)
 
     def test_row_filter_name_over_30_chars_is_refused(self):
-        name = "datahub_orders_region_filter"  # 32 chars
+        name = "sales_orders_by_region_rowfilter"  # 32 chars
         errors = validation_errors(self._filter(name))
         self.assertIn(f"row_filter '{name}'", errors)
         self.assertIn(f"{len(name)} chars", errors)

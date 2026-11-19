@@ -4,21 +4,19 @@ Deploy Starburst SEP BIAC entitlements (roles, grants, column masks, row
 filters, assignments) declared in a YAML file, via the BIAC REST API.
 
 Usage:
-    python3 biac_deploy.py --env .env.lab --config environments/demo-lab/biac.yaml --dry-run
-    python3 biac_deploy.py --env .env.lab --config environments/demo-lab/biac.yaml --apply
-    python3 biac_deploy.py --env .env.lab --config environments/demo-lab/biac.yaml --verify
-    python3 biac_deploy.py --config environments/demo-lab/biac.yaml --validate   # offline, no env, no network
+    python3 biac_deploy.py --env .env.mycluster --config examples/sample.biac.yaml --dry-run
+    python3 biac_deploy.py --env .env.mycluster --config examples/sample.biac.yaml --apply
+    python3 biac_deploy.py --env .env.mycluster --config examples/sample.biac.yaml --verify
+    python3 biac_deploy.py --config examples/sample.biac.yaml --validate   # offline, no env, no network
 
 Reviewed (signed) plan, no interactive prompt — the plan that was shown and
 validated is the only one that can be applied:
-    python3 biac_deploy.py --env .env.lab --config f.biac.yaml --dry-run --plan-out plan.json
-    python3 biac_deploy.py --env .env.lab --config f.biac.yaml --apply --plan plan.json
+    python3 biac_deploy.py --env .env.mycluster --config f.biac.yaml --dry-run --plan-out plan.json
+    python3 biac_deploy.py --env .env.mycluster --config f.biac.yaml --apply --plan plan.json
 
-Each cluster/environment gets its own folder under environments/<name>/,
-containing its biac.yaml (real catalog/schema/table names for that cluster)
-and its views.sql (schema + view creation for that cluster). Catalog/schema/
-table names are hardcoded per-environment — there is no cross-environment
-templating; copy an environment folder and edit both files to add a new one.
+Policy files are kept outside this repository, next to the project they
+belong to (one *.biac.yaml per cluster and use case, with the real catalog/
+schema/table names of that cluster). examples/ holds a generic sample.
 
 Design:
 - Idempotent: before creating any object, the existing cluster state is
@@ -52,7 +50,7 @@ Supported entity categories (grants):
   AI_MODELS      {category: AI_MODELS, allEntities: true}
   USER_INTERFACE {category: USER_INTERFACE, uiFeature}
                  (e.g. AI_MODELS, DATA_PRODUCTS, QUERY_EDITOR, CATALOG_EXPLORER)
-Formats read back from the BIAC API on the lab lab (2026-10-15).
+Formats read back from the BIAC API on a lab cluster (2026-10-15).
 Column masks and row filters only accept TABLES.
 Location grants (top-level 'location_grants': role, location, grant_option)
 use their own endpoint /api/v1/biac/roles/{id}/locationGrants.
@@ -221,8 +219,8 @@ def validate_config(config):
         # A catalog-wide or schema-wide grant is expressed by OMITTING the
         # narrower field(s) entirely — 'catalog' alone means catalog.*,
         # 'catalog'+'schema' alone means catalog.schema.*. A literal '*'
-        # string is NOT the mechanism for this (confirmed on staging,
-        # 2026-10-01) — reject it explicitly so it's never confused with
+        # string is NOT the mechanism for this (confirmed on a test
+        # cluster, 2026-10-01) — reject it explicitly so it's never confused with
         # omission.
         for field in ("schema", "table", "function"):
             if entity.get(field) == "*":
@@ -588,8 +586,8 @@ class BiacClient:
 
 def _norm(v):
     # The BIAC API normalizes catalog/schema/table/function names to
-    # lowercase regardless of the case sent (confirmed on lab, 2026-10-01:
-    # 'sales_5m' sent, 'sales_5m' stored) — compare case-insensitively so
+    # lowercase regardless of the case sent (confirmed on a lab cluster, 2026-10-01:
+    # 'sales_5M' sent, 'sales_5m' stored) — compare case-insensitively so
     # idempotency checks don't false-negative into recreating the same
     # grant/mask on every run.
     return v.lower() if isinstance(v, str) else v
@@ -979,7 +977,7 @@ def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--env", help="Path to .env file (SB_HOST/SB_PORT/SB_USER/SB_PASSWORD); "
                                  "required except with --validate")
-    p.add_argument("--config", required=True, help="Path to environments/<name>/biac.yaml")
+    p.add_argument("--config", required=True, help="Path to the policy file (<name>.biac.yaml)")
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true", help="Print the plan, no writes")
     mode.add_argument("--apply", action="store_true", help="Execute the plan")

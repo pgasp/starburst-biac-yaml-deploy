@@ -1,0 +1,54 @@
+# Sample BIAC policy, built on the built-in `tpch` catalog so it can be planned
+# on any SEP cluster with the TPCH connector. Generic example: no customer data.
+#
+#   python3 biac_deploy.py --config examples/sample.biac.yaml --validate
+#   python3 biac_deploy.py --env .env.mycluster --config examples/sample.biac.yaml --dry-run
+#
+# Three roles:
+#   - sample_analyst   : SELECT on tpch.tiny, phone masked, rows filtered to one region
+#   - sample_auditor   : column-level SELECT on tpch.tiny.customer (no phone, no comment)
+#   - sample_ops       : sees the stored values; may read an S3 prefix (location grant)
+
+roles:
+  - name: sample_analyst
+  - name: sample_auditor
+  - name: sample_ops
+
+grants:
+  - {role: sample_analyst, effect: ALLOW, action: SELECT, entity: {category: TABLES, catalog: tpch, schema: tiny}}
+  - {role: sample_analyst, effect: ALLOW, action: SHOW, entity: {category: TABLES, catalog: tpch, schema: tiny}}
+  - {role: sample_auditor, effect: ALLOW, action: SELECT, entity: {category: TABLES, catalog: tpch, schema: tiny, table: customer, columns: [custkey, name, nationkey, mktsegment, acctbal]}}
+  - {role: sample_ops, effect: ALLOW, action: [SELECT, SHOW], entity: {category: TABLES, catalog: tpch, schema: tiny}}
+  - {role: sample_ops, effect: ALLOW, action: SHOW, entity: {category: USER_INTERFACE, uiFeature: QUERY_EDITOR}}
+
+location_grants:
+  - {role: sample_ops, location: "s3://example-bucket/landing/*", grant_option: false}
+
+# A mask may return another column of the same row; that column must then be
+# granted to the masked role too (the mask runs with the caller's rights).
+column_masks:
+  - name: sample_customer_phone_mask
+    description: Keep the country code only
+    expression: "substr(phone, 1, 3) || '-***-***-****'"
+    role: sample_analyst
+    entity:
+      category: TABLES
+      catalog: tpch
+      schema: tiny
+      table: customer
+      columns: [phone]
+
+row_filters:
+  - name: sample_nation_europe_only
+    description: Rows of European nations only
+    expression: "regionkey = 3"
+    role: sample_analyst
+    entity: {category: TABLES, catalog: tpch, schema: tiny, table: nation}
+
+assignments:
+  - {role: sample_analyst, users: [demo_analyst]}
+  - {role: sample_auditor, groups: [demo_auditors]}
+
+# Guardrails: the accounts this file may assign. Nothing is catalog-wide.
+allowed_users: [demo_analyst]
+allowed_groups: [demo_auditors]
