@@ -7,9 +7,9 @@ declarative YAML file, via the BIAC REST API.
 ## Structure
 
 ```
-biac_deploy.py            # the tool (single file, PyYAML only)
-examples/sample.biac.yaml # generic, commented policy on the built-in tpch catalog
-tests/                    # offline unit tests (simulated BIAC client)
+biac_deploy.py   # the tool (single file, PyYAML only)
+examples/        # generic, commented policies, one per feature (see "Examples")
+tests/           # offline unit tests (simulated BIAC client); they also validate every example
 ```
 
 **This repository holds no customer policy.** Real policy files live with the
@@ -103,9 +103,45 @@ cluster. Exit codes: `0` ok, `1` runtime error / manual apply aborted,
 
 ## Policy file format (`*.biac.yaml`)
 
-See `examples/sample.biac.yaml` for a complete, commented example (roles,
-schema-wide and column-level grants, a UI grant, a location grant, a column
-mask, a row filter, assignments and guardrails) on the built-in `tpch` catalog.
+See "Examples" below for complete, commented files covering every feature.
+
+### Examples
+
+All files are in `examples/`, use generic names (mostly the built-in `tpch`
+catalog) and pass `--validate`; `python3 -m unittest` fails if one stops
+validating.
+
+| File | Shows |
+|---|---|
+| [`sample.biac.yaml`](examples/sample.biac.yaml) | A small end-to-end policy: three roles, schema and column grants, a UI grant, a location grant, one mask, one row filter, assignments and guardrails. Start here. |
+| [`table-access.biac.yaml`](examples/table-access.biac.yaml) | Every TABLES scope (catalog-wide with `allow_catalog_wide`, schema, table, columns), the three effects (`ALLOW`, `DENY`, `ALLOW_WITH_GRANT_OPTION` for a SECURITY DEFINER view owner), multi-action grants, a writable sandbox (`CREATE`/`INSERT`/`REFRESH`…), location grants with and without grant option. |
+| [`column-masks.biac.yaml`](examples/column-masks.biac.yaml) | Partial mask, hash (pseudonymisation), `NULL`, and a mask that returns **another column** of the same row (with the column grant it needs). |
+| [`row-filters.biac.yaml`](examples/row-filters.biac.yaml) | Static filter, per-user perimeter from a mapping table (`current_user` subquery, with the grant on the mapping table), group-based filter (`current_groups()`), and a role without filter. |
+| [`functions.biac.yaml`](examples/functions.biac.yaml) | `EXECUTE` on one routine, `CREATE`/`DROP`/`EXECUTE`/`SHOW` on a whole routine schema, `DENY` on one routine, `ALLOW_WITH_GRANT_OPTION` for a view owner. |
+| [`data-products-ai-ui.biac.yaml`](examples/data-products-ai-ui.biac.yaml) | Data products (whole domain, one product, publisher actions incl. `PUBLISH`), AI models (`allEntities: true`), UI features (`QUERY_EDITOR`, `CATALOG_EXPLORER`, `DATA_PRODUCTS`, `AI_MODELS`). |
+
+```bash
+python3 biac_deploy.py --config examples/column-masks.biac.yaml --validate              # offline
+python3 biac_deploy.py --env .env.mycluster --config examples/sample.biac.yaml --dry-run # plan only
+```
+
+Only `sample.biac.yaml` is meant to be applied as is on a test cluster (it
+uses `tpch` and assigns `demo_*` accounts). The others reference placeholder
+catalogs (`lakehouse`, `postgres`), groups and routines: adapt the names first.
+
+Actions used in the examples, by category (all applied on SEP 482-e lab
+clusters):
+
+| Category | Actions |
+|---|---|
+| `TABLES` | `SELECT`, `SHOW`, `CREATE`, `DROP`, `INSERT`, `DELETE`, `REFRESH` (materialized views) |
+| `FUNCTIONS` | `EXECUTE`, `CREATE`, `DROP`, `SHOW` |
+| `DATA_PRODUCTS` | `SHOW`, `CREATE`, `ALTER`, `DROP`, `PUBLISH` |
+| `AI_MODELS` | `EXECUTE` |
+| `USER_INTERFACE` | `SHOW` |
+
+The validator does not check action names: a misspelt action is only caught
+by the BIAC API, during `--apply`.
 
 **Style convention — keep every grant on one flow-style line**, even when
 `action` is a list:

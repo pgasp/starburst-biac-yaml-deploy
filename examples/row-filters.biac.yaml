@@ -1,0 +1,54 @@
+# Row filters (row-level security): a boolean expression evaluated per row,
+# attached to one role on one table (never schema- or catalog-wide).
+#
+#   python3 biac_deploy.py --config examples/row-filters.biac.yaml --validate
+#
+# Rules worth knowing:
+#   - `name` <= 30 characters, `description` <= 250, no `columns` on the entity.
+#   - Like masks, the filter runs with the caller's rights: a table read in a
+#     subquery (mapping table) must be readable by the filtered role.
+#   - A role with no filter on the table sees every row it is granted.
+
+roles:
+  - name: ex_region_europe
+  - name: ex_by_user
+  - name: ex_by_group
+  - name: ex_national        # no filter: sees all rows
+
+grants:
+  - {role: ex_region_europe, effect: ALLOW, action: [SELECT, SHOW], entity: {category: TABLES, catalog: tpch, schema: tiny, table: nation}}
+  - {role: ex_by_user, effect: ALLOW, action: [SELECT, SHOW], entity: {category: TABLES, catalog: tpch, schema: tiny, table: customer}}
+  # Mapping table read by the filter subquery below.
+  - {role: ex_by_user, effect: ALLOW, action: SELECT, entity: {category: TABLES, catalog: postgres, schema: security, table: user_perimeter}}
+  - {role: ex_by_group, effect: ALLOW, action: [SELECT, SHOW], entity: {category: TABLES, catalog: tpch, schema: tiny, table: orders}}
+  - {role: ex_national, effect: ALLOW, action: [SELECT, SHOW], entity: {category: TABLES, catalog: tpch, schema: tiny}}
+
+row_filters:
+  # Static filter.
+  - name: ex_nation_europe
+    description: European nations only
+    expression: "regionkey = 3"
+    role: ex_region_europe
+    entity: {category: TABLES, catalog: tpch, schema: tiny, table: nation}
+
+  # Per-user perimeter from a mapping table (user -> allowed keys).
+  - name: ex_customer_by_user
+    description: Nations listed for the current user in the mapping table
+    expression: "nationkey IN (SELECT nationkey FROM postgres.security.user_perimeter WHERE upn = current_user)"
+    role: ex_by_user
+    entity: {category: TABLES, catalog: tpch, schema: tiny, table: customer}
+
+  # Group membership of the current user.
+  - name: ex_orders_by_group
+    description: Urgent orders only, unless the user is in group priority_all
+    expression: "orderpriority = '1-URGENT' OR contains(current_groups(), 'priority_all')"
+    role: ex_by_group
+    entity: {category: TABLES, catalog: tpch, schema: tiny, table: orders}
+
+assignments:
+  - {role: ex_region_europe, groups: [europe_team]}
+  - {role: ex_by_user, groups: [field_agents]}
+  - {role: ex_by_group, groups: [ops]}
+  - {role: ex_national, groups: [headquarters]}
+
+allowed_groups: [europe_team, field_agents, ops, headquarters]

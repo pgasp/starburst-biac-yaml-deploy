@@ -1,0 +1,30 @@
+# SQL routines and UDFs (category FUNCTIONS): execute, manage, deny, delegate.
+# `function` is the routine name; omit it for every routine of the schema.
+#
+#   python3 biac_deploy.py --config examples/functions.biac.yaml --validate
+
+roles:
+  - name: ex_fn_user         # may call two routines
+  - name: ex_fn_developer    # may create / drop routines in its schema
+  - name: ex_fn_owner        # owns views calling the routines
+
+grants:
+  # One routine.
+  - {role: ex_fn_user, effect: ALLOW, action: EXECUTE, entity: {category: FUNCTIONS, catalog: lakehouse, schema: udf, function: normalize_phone}}
+  - {role: ex_fn_user, effect: ALLOW, action: EXECUTE, entity: {category: FUNCTIONS, catalog: lakehouse, schema: udf, function: mask_email}}
+  # DENY one routine of a schema otherwise granted.
+  - {role: ex_fn_developer, effect: DENY, action: EXECUTE, entity: {category: FUNCTIONS, catalog: lakehouse, schema: udf, function: decrypt_value}}
+
+  # Every routine of a schema (omit `function`), several actions at once.
+  - {role: ex_fn_developer, effect: ALLOW, action: [CREATE, DROP, EXECUTE, SHOW], entity: {category: FUNCTIONS, catalog: lakehouse, schema: udf}}
+
+  # A view owner that calls routines inside SECURITY DEFINER views needs them
+  # WITH GRANT OPTION.
+  - {role: ex_fn_owner, effect: ALLOW_WITH_GRANT_OPTION, action: EXECUTE, entity: {category: FUNCTIONS, catalog: lakehouse, schema: udf}}
+
+assignments:
+  - {role: ex_fn_user, groups: [analysts]}
+  - {role: ex_fn_developer, users: [udf_dev_1]}
+
+allowed_users: [udf_dev_1]
+allowed_groups: [analysts]

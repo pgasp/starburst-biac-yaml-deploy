@@ -1,0 +1,82 @@
+# Column masks (column-level security): one expression per mask, attached to
+# one role on one table. A role without a mask on a column sees the stored value.
+#
+#   python3 biac_deploy.py --config examples/column-masks.biac.yaml --validate
+#
+# Rules worth knowing:
+#   - `name` <= 30 characters (BIAC API limit), `description` <= 250.
+#   - The mask runs with the CALLER's rights: every column it references must
+#     be granted to the masked role, or the query fails with Access Denied.
+#   - WHERE / JOIN on a masked column use the masked value (no leak).
+#   - Changing an expression that already exists under the same name is planned
+#     as DRIFT and --apply refuses: rename it, or update it on the cluster.
+
+roles:
+  - name: ex_support
+  - name: ex_marketing
+  - name: ex_regional
+
+grants:
+  - {role: ex_support, effect: ALLOW, action: [SELECT, SHOW], entity: {category: TABLES, catalog: tpch, schema: tiny, table: customer}}
+  - {role: ex_marketing, effect: ALLOW, action: [SELECT, SHOW], entity: {category: TABLES, catalog: tpch, schema: tiny, table: customer}}
+  # ex_regional reads `address` AND `name`: `name` must be granted because the
+  # mask on `address` below references it.
+  - {role: ex_regional, effect: ALLOW, action: SELECT, entity: {category: TABLES, catalog: tpch, schema: tiny, table: customer, columns: [custkey, name, address, nationkey]}}
+
+column_masks:
+  # Partial mask: keep a prefix.
+  - name: ex_cust_phone_partial
+    description: Country code only
+    expression: "substr(phone, 1, 3) || '-***-***-****'"
+    role: ex_support
+    entity:
+      category: TABLES
+      catalog: tpch
+      schema: tiny
+      table: customer
+      columns: [phone]
+
+  # Pseudonymisation: stable hash, still joinable across tables.
+  - name: ex_cust_name_hash
+    description: SHA-256 of the name, hex
+    expression: "to_hex(sha256(to_utf8(name)))"
+    role: ex_marketing
+    entity:
+      category: TABLES
+      catalog: tpch
+      schema: tiny
+      table: customer
+      columns: [name]
+
+  # Suppression: NULL, typed like the column.
+  - name: ex_cust_acctbal_null
+    description: Balance hidden
+    expression: "CAST(NULL AS double)"
+    role: ex_marketing
+    entity:
+      category: TABLES
+      catalog: tpch
+      schema: tiny
+      table: customer
+      columns: [acctbal]
+
+  # Value taken from ANOTHER column of the same row: the role sees `name` in
+  # place of `address`. Same pattern gives one view column a different value
+  # per role, without any CASE on roles in the view.
+  - name: ex_cust_address_from_name
+    description: Address replaced by the customer name for regional users
+    expression: "name"
+    role: ex_regional
+    entity:
+      category: TABLES
+      catalog: tpch
+      schema: tiny
+      table: customer
+      columns: [address]
+
+assignments:
+  - {role: ex_support, groups: [support]}
+  - {role: ex_marketing, groups: [marketing]}
+  - {role: ex_regional, groups: [regional_teams]}
+
+allowed_groups: [support, marketing, regional_teams]

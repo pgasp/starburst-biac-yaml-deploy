@@ -1,0 +1,39 @@
+# Non-data entities: data products, AI models and UI features (grants only;
+# masks and row filters accept TABLES only).
+#
+#   python3 biac_deploy.py --config examples/data-products-ai-ui.biac.yaml --validate
+#
+# The UI privileges of the built-in `public` role ADD UP to those of the
+# active role: a menu granted to `public` stays visible whatever you grant here.
+
+roles:
+  - name: ex_dp_consumer     # browses the data products of one domain
+  - name: ex_dp_publisher    # creates and publishes data products in that domain
+  - name: ex_ai_user         # uses the AI models from SQL and the UI
+  - name: ex_sql_only        # query editor and catalog explorer, nothing else
+
+grants:
+  # Data products: `domainName` alone = every product of the domain;
+  # add `dataProductName` for one product.
+  - {role: ex_dp_consumer, effect: ALLOW, action: SHOW, entity: {category: DATA_PRODUCTS, domainName: Sales}}
+  - {role: ex_dp_consumer, effect: ALLOW, action: SHOW, entity: {category: DATA_PRODUCTS, domainName: Finance, dataProductName: monthly_revenue}}
+  - {role: ex_dp_publisher, effect: ALLOW, action: [SHOW, CREATE, ALTER, DROP, PUBLISH], entity: {category: DATA_PRODUCTS, domainName: Sales}}
+  # The underlying tables still need their own TABLES grants.
+  - {role: ex_dp_consumer, effect: ALLOW, action: [SELECT, SHOW], entity: {category: TABLES, catalog: lakehouse, schema: sales_dp}}
+
+  # AI models: only `allEntities: true` (all models) is supported.
+  - {role: ex_ai_user, effect: ALLOW, action: EXECUTE, entity: {category: AI_MODELS, allEntities: true}}
+
+  # UI features (uiFeature): QUERY_EDITOR, CATALOG_EXPLORER, DATA_PRODUCTS, AI_MODELS, ...
+  - {role: ex_ai_user, effect: ALLOW, action: SHOW, entity: {category: USER_INTERFACE, uiFeature: AI_MODELS}}
+  - {role: ex_dp_consumer, effect: ALLOW, action: SHOW, entity: {category: USER_INTERFACE, uiFeature: DATA_PRODUCTS}}
+  - {role: ex_sql_only, effect: ALLOW, action: SHOW, entity: {category: USER_INTERFACE, uiFeature: QUERY_EDITOR}}
+  - {role: ex_sql_only, effect: ALLOW, action: SHOW, entity: {category: USER_INTERFACE, uiFeature: CATALOG_EXPLORER}}
+
+assignments:
+  - {role: ex_dp_consumer, groups: [business_users]}
+  - {role: ex_dp_publisher, groups: [data_owners]}
+  - {role: ex_ai_user, groups: [ai_pilot]}
+  - {role: ex_sql_only, groups: [business_users]}
+
+allowed_groups: [business_users, data_owners, ai_pilot]

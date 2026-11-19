@@ -608,5 +608,18 @@ class ExpressionNameLengthTests(unittest.TestCase):
         self.assertIn(f"{len(name)} chars", errors)
 
 
+class ExampleFilesTests(unittest.TestCase):
+    """Every documented example must pass the validator and guardrails."""
+
+    EXAMPLES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
+
+    def test_examples_validate(self):
+        files = sorted(f for f in os.listdir(self.EXAMPLES) if f.endswith(".biac.yaml"))
+        self.assertGreaterEqual(len(files), 6)
+        for f in files:
+            with self.subTest(example=f), contextlib.redirect_stderr(io.StringIO()):
+                bd.validate_config(bd.load_config(os.path.join(self.EXAMPLES, f)))
+
+
 if __name__ == "__main__":
     unittest.main()

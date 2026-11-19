@@ -1,0 +1,50 @@
+# Table and view privileges: every scope (catalog / schema / table / columns),
+# every effect (ALLOW / DENY / ALLOW_WITH_GRANT_OPTION), multi-action grants,
+# a writable workspace and a location grant.
+#
+#   python3 biac_deploy.py --config examples/table-access.biac.yaml --validate
+
+roles:
+  - name: ex_reader          # read-only on one schema
+  - name: ex_column_reader   # column-level access on one table
+  - name: ex_view_owner      # owns SECURITY DEFINER views built on the sources
+  - name: ex_workspace       # may create tables / materialized views in a sandbox schema
+  - name: ex_admin_lab       # catalog-wide access, explicitly opted in below
+
+grants:
+  # Schema-wide: omit `table` (never `table: '*'`, never `table: ""`).
+  - {role: ex_reader, effect: ALLOW, action: [SELECT, SHOW], entity: {category: TABLES, catalog: tpch, schema: tiny}}
+  # DENY wins over ALLOW: hide one table of the schema granted above.
+  - {role: ex_reader, effect: DENY, action: SELECT, entity: {category: TABLES, catalog: tpch, schema: tiny, table: supplier}}
+
+  # Column-level: only these columns are readable; `SELECT *` is refused.
+  # The column list is part of the grant identity: changing it creates a new
+  # grant and leaves the old one in place (see README).
+  - {role: ex_column_reader, effect: ALLOW, action: SELECT, entity: {category: TABLES, catalog: tpch, schema: tiny, table: orders, columns: [orderkey, orderdate, orderstatus, totalprice]}}
+  - {role: ex_column_reader, effect: ALLOW, action: SHOW, entity: {category: TABLES, catalog: tpch, schema: tiny, table: orders}}
+
+  # View owner: a SECURITY DEFINER view reads its sources with the owner's
+  # rights, and the owner may only expose what it holds WITH GRANT OPTION.
+  - {role: ex_view_owner, effect: ALLOW_WITH_GRANT_OPTION, action: SELECT, entity: {category: TABLES, catalog: tpch, schema: tiny}}
+  - {role: ex_view_owner, effect: ALLOW, action: [CREATE, DROP, SHOW], entity: {category: TABLES, catalog: lakehouse, schema: secure_views}}
+
+  # Writable sandbox: tables and materialized views in one schema only.
+  - {role: ex_workspace, effect: ALLOW, action: [CREATE, DROP, INSERT, DELETE, SELECT, SHOW, REFRESH], entity: {category: TABLES, catalog: lakehouse, schema: sandbox}}
+
+  # Catalog-wide: omit `schema`. Refused unless the catalog is listed in
+  # `allow_catalog_wide` (root of the file).
+  - {role: ex_admin_lab, effect: ALLOW, action: [SELECT, SHOW], entity: {category: TABLES, catalog: tpch}}
+
+# Object-store locations a role may use for CREATE TABLE ... WITH (location = ...).
+location_grants:
+  - {role: ex_workspace, location: "s3://example-bucket/sandbox/*"}
+  - {role: ex_view_owner, location: "s3://example-bucket/secure_views/*", grant_option: true}
+
+assignments:
+  - {role: ex_reader, groups: [analysts]}
+  - {role: ex_column_reader, groups: [partners]}
+  - {role: ex_workspace, users: [data_scientist_1]}
+
+allowed_users: [data_scientist_1]
+allowed_groups: [analysts, partners]
+allow_catalog_wide: [tpch]
