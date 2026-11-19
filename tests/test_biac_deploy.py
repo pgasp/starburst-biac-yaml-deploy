@@ -117,6 +117,103 @@ class FakeClient:
         self.writes += 1
         self.assign.add(("g", group, role_id))
 
+    # --- reads and deletions used by the `remove:` section. An object's id is its own key. ---
+    fail_after = None  # raise on the deletion that comes after this many successful ones
+
+    def _delete(self, store, key, label):
+        if self.fail_after is not None and len(self.deletes) >= self.fail_after:
+            raise RuntimeError(f"DELETE {label} failed: 500 boom")
+        store.discard(key)
+        self.writes += 1
+        self.deletes.append(label)
+
+    @property
+    def deletes(self):
+        return self.__dict__.setdefault("_deletes", [])
+
+    def role_name(self, role_id):
+        return next(n for n, i in self.roles.items() if i == role_id)
+
+    def list_roles(self):
+        return [{"id": i, "name": n} for n, i in self.roles.items()]
+
+    def delete_role(self, role_id):
+        if self.fail_after is not None and len(self.deletes) >= self.fail_after:
+            raise RuntimeError("DELETE role failed: 500 boom")
+        del self.roles[self.role_name(role_id)]
+        self.writes += 1
+        self.deletes.append(f"role {role_id}")
+
+    def list_grants(self, role_id):
+        return [{"id": k, "effect": k[1], "action": k[2], "entity": json.loads(k[3])}
+                for k in sorted(self.grants) if k[0] == role_id]
+
+    def find_grant(self, role_id, effect, action, entity):
+        return next((g for g in self.list_grants(role_id) if g["effect"] == effect and g["action"] == action
+                     and bd.entities_equal(g["entity"], entity)), None)
+
+    def delete_grant(self, role_id, grant_id):
+        self._delete(self.grants, grant_id, f"grant {grant_id[2]} {grant_id[3]}")
+
+    def list_location_grants(self, role_id):
+        return [{"id": k, "location": k[1], "grantOption": k[2]} for k in sorted(self.loc) if k[0] == role_id]
+
+    def find_location_grant(self, role_id, location, go):
+        return next((g for g in self.list_location_grants(role_id)
+                     if g["location"] == location and g["grantOption"] == go), None)
+
+    def delete_location_grant(self, role_id, key):
+        self._delete(self.loc, key, f"location {key[1]}")
+
+    def _atts(self, store, role_id):
+        return [{"id": k, "entity": json.loads(k[1]), "expressionId": k[2]} for k in sorted(store) if k[0] == role_id]
+
+    def list_column_masks(self, role_id):
+        return self._atts(self.mask_att, role_id)
+
+    def list_row_filters(self, role_id):
+        return self._atts(self.rf_att, role_id)
+
+    def find_column_mask_attachment(self, role_id, entity, expr_id):
+        return next((a for a in self.list_column_masks(role_id)
+                     if a["expressionId"] == expr_id and bd.entities_equal(a["entity"], entity)), None)
+
+    def find_row_filter_attachment(self, role_id, entity, expr_id):
+        return next((a for a in self.list_row_filters(role_id)
+                     if a["expressionId"] == expr_id and bd.entities_equal(a["entity"], entity)), None)
+
+    def detach_column_mask(self, role_id, key):
+        self._delete(self.mask_att, key, f"mask-attach {key[2]}")
+
+    def detach_row_filter(self, role_id, key):
+        self._delete(self.rf_att, key, f"filter-attach {key[2]}")
+
+    def delete_column_mask_expression(self, expr_id):
+        name = next(n for n, i in self.mask_expr.items() if i == expr_id)
+        self._delete(set(), None, f"mask-expression {name}")
+        del self.mask_expr[name]
+
+    def delete_row_filter_expression(self, expr_id):
+        name = next(n for n, i in self.rf_expr.items() if i == expr_id)
+        self._delete(set(), None, f"filter-expression {name}")
+        del self.rf_expr[name]
+
+    def list_role_assignments(self, role_id):
+        return [{"id": k, "subject": {"type": "USER", "username": k[1]} if k[0] == "u"
+                 else {"type": "GROUP", "groupName": k[1]}} for k in sorted(self.assign) if k[2] == role_id]
+
+    def find_user_assignment(self, user, role_id):
+        return {"id": ("u", user, role_id), "roleId": role_id} if ("u", user, role_id) in self.assign else None
+
+    def find_group_assignment(self, group, role_id):
+        return {"id": ("g", group, role_id), "roleId": role_id} if ("g", group, role_id) in self.assign else None
+
+    def delete_user_assignment(self, user, key):
+        self._delete(self.assign, key, f"assignment user {user}")
+
+    def delete_group_assignment(self, group, key):
+        self._delete(self.assign, key, f"assignment group {group}")
+
 
 def read_json(path):
     with open(path) as f:

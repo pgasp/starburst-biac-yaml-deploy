@@ -1,13 +1,15 @@
 """Applying a policy to the cluster, and reading it back (verify).
 
-apply() follows the same stage order as planner.plan(). It only ever creates:
-nothing is deleted, revoked or overwritten.
+apply() follows the same stage order as planner.plan(): every creation first,
+then the removals declared under `remove:` (see removal.py). Nothing is deleted,
+revoked or overwritten unless it is declared there.
 """
 import json
 
 from .entities import describe_entity
 from .planner import DRIFT_ACTION, expression_drifts
 from .policy import COLUMN_MASKS, ROW_FILTERS, grant_actions
+from .removal import apply_removals, plan_removals, verify_removals
 
 EXPRESSION_KINDS = (COLUMN_MASKS, ROW_FILTERS)
 
@@ -99,6 +101,7 @@ class _Applier:
 
 def apply(client, config):
     _refuse_drift(client, config)
+    removals = plan_removals(client, config)  # reads only; refuses before anything is written
     a = _Applier(client, config)
     a.roles()
     a.expressions(COLUMN_MASKS)
@@ -108,6 +111,7 @@ def apply(client, config):
     a.expressions(ROW_FILTERS)
     a.attachments(ROW_FILTERS)
     a.assignments()
+    apply_removals(removals)
 
 
 def verify(client, config):
@@ -128,3 +132,4 @@ def verify(client, config):
             for m in kind.list_attached(client, role_id):
                 print(f"    {kind.name}: {describe_entity(m.get('entity', {}))} "
                       f"(expressionId={m.get('expressionId')})")
+    verify_removals(client, config)

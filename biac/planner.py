@@ -3,12 +3,13 @@
 The order of the stages below is the order of the plan, and the same as in
 executor.apply: roles, column-mask expressions, grants, location grants,
 column-mask attachments, row-filter expressions, row-filter attachments,
-assignments.
+assignments; then the removals of the `remove:` section (removal.py).
 """
 import re
 
 from .entities import describe_entity
 from .policy import COLUMN_MASKS, ROW_FILTERS, grant_actions
+from .removal import DELETE, plan_removals, removal_actions
 
 CREATE = "CREATE"
 SKIP = "SKIP (exists)"
@@ -36,6 +37,15 @@ def drift_label(name, existing, wanted_text):
 
 def drift_actions(actions):
     return [a for a in actions if a[2] == DRIFT_ACTION]
+
+
+def pending_changes(actions):
+    """Actions that write: creations and deletions."""
+    return [a for a in actions if a[2] in (CREATE, DELETE)]
+
+
+def deletions(actions):
+    return [a for a in actions if a[2] == DELETE]
 
 
 def print_plan(actions, title):
@@ -113,8 +123,9 @@ class _Planner:
 def plan(client, config):
     """Returns a list of (kind, description, action) where action is
     'CREATE', 'SKIP (exists)' or, for row-filter / column-mask expressions
-    whose text differs from the cluster's, 'DRIFT (expression differs)'.
-    Read-only — no writes."""
+    whose text differs from the cluster's, 'DRIFT (expression differs)';
+    then, for the `remove:` section, 'DELETE' or 'SKIP (absent)'.
+    Raises ValueError if a removal is refused. Read-only — no writes."""
     p = _Planner(client, config)
     p.roles()
     p.expressions(COLUMN_MASKS)
@@ -124,4 +135,4 @@ def plan(client, config):
     p.expressions(ROW_FILTERS)
     p.attachments(ROW_FILTERS)
     p.assignments()
-    return p.actions
+    return p.actions + removal_actions(plan_removals(client, config))

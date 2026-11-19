@@ -41,7 +41,9 @@ class ExpressionKind:
     a role on one table: column masks and row filters are the two instances.
 
     Their client methods follow one naming scheme (find_<name>_expression,
-    create_<name>_expression, <name>_attached, attach_<name>, list_<name>s);
+    create_<name>_expression, <name>_attached, attach_<name>, list_<name>s,
+    and for removals find_<name>_attachment, detach_<name>,
+    delete_<name>_expression);
     this class is the single place that knows it, so planner, executor and
     verify handle both kinds with the same code.
     """
@@ -52,6 +54,8 @@ class ExpressionKind:
         self.verb = verb          # word used in plan labels: 'mask'
         self.expression_kind = f"{name}_expression"   # plan / apply output tag
         self.attach_kind = f"{name}_attach"           # plan output tag
+        self.remove_kind = f"remove_{name}_attach"                  # plan tag of a detach
+        self.remove_expression_kind = f"remove_{name}_expression"   # plan tag of an expression deletion
 
     def find(self, client, name):
         return getattr(client, f"find_{self.name}_expression")(name)
@@ -67,6 +71,15 @@ class ExpressionKind:
 
     def list_attached(self, client, role_id):
         return getattr(client, f"list_{self.name}s")(role_id)
+
+    def find_attachment(self, client, role_id, entity, expression_id):
+        return getattr(client, f"find_{self.name}_attachment")(role_id, entity, expression_id)
+
+    def detach(self, client, role_id, attachment_id):
+        return getattr(client, f"detach_{self.name}")(role_id, attachment_id)
+
+    def delete_expression(self, client, expression_id):
+        return getattr(client, f"delete_{self.name}_expression")(expression_id)
 
 
 COLUMN_MASKS = ExpressionKind("column_mask", "column_masks", "mask")

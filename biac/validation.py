@@ -12,9 +12,10 @@ from .entities import NON_DATA_CATEGORIES, NON_DATA_CATEGORIES_KEYS
 from .policy import (COLUMN_MASKS, EFFECTS, FORBIDDEN_ROLES, MAX_DESCRIPTION_LENGTH,
                      MAX_EXPRESSION_NAME_LENGTH, ROLE_NAME_RE, ROW_FILTERS, WIDENING_EFFECTS,
                      grant_actions)
+from .remove_validation import check_remove
 
 KNOWN_TOP_LEVEL_KEYS = {"roles", "grants", "location_grants", "column_masks", "row_filters", "assignments",
-                        "allow_catalog_wide", "allowed_users", "allowed_groups"}
+                        "allow_catalog_wide", "allowed_users", "allowed_groups", "remove"}
 KNOWN_GRANT_KEYS = {"role", "effect", "action", "entity"}
 KNOWN_LOCATION_GRANT_KEYS = {"role", "location", "grant_option"}
 KNOWN_EXPRESSION_KEYS = {"name", "description", "expression", "role", "entity"}  # masks and filters
@@ -118,6 +119,7 @@ class _Validator:
         self.check_expression_objects(COLUMN_MASKS, self.check_mask_entity)
         self.check_expression_objects(ROW_FILTERS, self.check_row_filter_entity)
         self.check_assignments()
+        check_remove(self)
 
     # --- shared checks ---
 

@@ -1,7 +1,7 @@
 """BIAC policy-as-code: the library behind the `biac_deploy.py` command.
 
-Modules: policy (constants, shared helpers), entities, validation, config,
-client, planner, executor, signed_plan, cli.
+Modules: policy (constants, shared helpers), entities, validation, remove_validation,
+config, client, planner, removal, executor, signed_plan, cli.
 """
 import sys
 

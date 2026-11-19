@@ -23,8 +23,10 @@ Design:
   read via GET and compared. Matching objects are skipped, never recreated.
 - Fail closed: config validation happens entirely before any network call.
   Any invalid or ambiguous entry aborts the whole run — nothing partial.
-- No implicit destructive action: this script never deletes or revokes
-  anything. Pruning is explicitly out of scope for v1. Drift detection is
+- No implicit destructive action: nothing is deleted or revoked unless it is
+  declared under the root key `remove:` (see the README, "Removing
+  entitlements"). Pruning (deleting what is not in the YAML) is out of scope.
+  Removals run after every creation. Drift detection is
   limited to row-filter / column-mask expressions: an expression that exists
   under the same name but with a different text (whitespace-normalised) is
   planned as 'DRIFT (expression differs)' and --apply refuses (exit 4) while
@@ -34,8 +36,9 @@ Design:
   changed in place (e.g. ALLOW -> ALLOW_WITH_GRANT_OPTION on the same
   entity) — the BIAC API itself rejects a duplicate create in that case
   (409 ALREADY_EXISTS, keyed on action+entity, ignoring effect). To change
-  an existing one, delete it on the cluster first (outside this tool), then
-  re-run --apply.
+  an existing one, list it under `remove:` and apply, then move it back to
+  its creation section with the new value and apply again (one file cannot
+  create and remove the same object).
 - allEntities:true is never emitted for data entities — TABLES/FUNCTIONS
   are always scoped (catalog, catalog+schema, or catalog+schema+table/
   function), matching the BIAC API constraint that allEntities:true forbids
@@ -79,6 +82,8 @@ from biac.planner import (DRIFT_ACTION, drift_actions, drift_label, expression_d
                           expression_text, plan, print_plan)
 from biac.policy import (FORBIDDEN_ROLES, MAX_DESCRIPTION_LENGTH, MAX_EXPRESSION_NAME_LENGTH,  # noqa: E402,F401
                          ROLE_NAME_RE, WIDENING_EFFECTS, grant_actions)
+from biac.removal import (DELETE, SKIP_ABSENT, apply_removals, plan_removals, removal_actions,  # noqa: E402,F401
+                          removal_steps, verify_removals)
 from biac.signed_plan import (PLAN_FILE_VERSION, build_signed_plan, canonical_json, check_signed_plan,  # noqa: E402,F401
                               load_plan_file, plan_diff_lines, plan_fingerprint, plan_records,
                               sha256_hex, write_plan_file)

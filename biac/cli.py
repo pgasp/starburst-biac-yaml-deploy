@@ -15,7 +15,7 @@ import yaml
 from .client import BiacClient
 from .config import load_env, parse_config, read_config_bytes
 from .executor import apply, verify
-from .planner import CREATE, drift_actions, plan, print_plan
+from .planner import CREATE, deletions, drift_actions, pending_changes, plan, print_plan
 from .signed_plan import build_signed_plan, check_signed_plan, load_plan_file, write_plan_file
 
 EXIT_VALIDATION = 2    # invalid YAML / guardrail violation / bad CLI usage
@@ -114,21 +114,29 @@ def _apply_signed(plan_path, s, actions):
         print("Re-run --dry-run --plan-out and have the new plan validated.", file=sys.stderr)
         return EXIT_PLAN_REFUSED
     print_plan(actions, f"=== Plan (matches signed plan {signed['fingerprint'][:12]}…) ===")
-    if not any(a[2] == CREATE for a in actions):
+    if not pending_changes(actions):
         print("\nNothing to do — cluster state already matches config.")
         return 0
+    _print_change_counts(actions)
     print("\n=== Applying (signed plan, no prompt) ===")
     apply(s.client, s.config)
     return 0
 
 
+def _print_change_counts(actions):
+    creations = [a for a in actions if a[2] == CREATE]
+    if creations:
+        print(f"\n{len(creations)} new entitlement object(s) will be created (see plan above).")
+    if deletions(actions):
+        print(f"\n{len(deletions(actions))} object(s) will be DELETED (see plan above, REMOVE lines).")
+
+
 def _apply_after_prompt(s, actions):
     print_plan(actions, "=== Plan ===")
-    creations = [a for a in actions if a[2] == CREATE]
-    if not creations:
+    if not pending_changes(actions):
         print("\nNothing to do — cluster state already matches config.")
         return 0
-    print(f"\n{len(creations)} new entitlement object(s) will be created (see plan above).")
+    _print_change_counts(actions)
     if input("Type 'yes' to proceed: ").strip().lower() != "yes":
         print("Aborted.")
         return 1

@@ -12,10 +12,12 @@ biac/            # the library (stdlib + PyYAML only), one concern per module:
   policy.py        #   rules and vocabulary: forbidden roles, limits, grant actions, mask/filter kinds
   entities.py      #   entity comparison (case-insensitive) and display
   validation.py    #   structural validation and guardrails, one method per file section
+  remove_validation.py #  the same for the `remove:` section (incl. create/remove conflicts)
   config.py        #   --env and --config loading
   client.py        #   BIAC REST client (one generic layer, thin per-object methods)
   planner.py       #   dry-run plan, expression drift detection
-  executor.py      #   apply (create only) and verify (read-back)
+  removal.py       #   the `remove:` section: ordered DELETE / SKIP (absent) steps, apply, verify
+  executor.py      #   apply (creations, then removals) and verify (read-back)
   signed_plan.py   #   --plan-out / --plan: fingerprint, plan file, refusal reasons
   cli.py           #   arguments, the four modes, exit codes, error display
 examples/        # generic, commented policies, one per feature (see "Examples")
@@ -24,7 +26,8 @@ tests/           # offline unit tests (simulated BIAC client); they also validat
 
 Where to change what: a new guardrail goes in `validation.py`; a new kind of
 object needs `validation.py`, `client.py`, and a stage in both `planner.py`
-and `executor.py` (the two walk the kinds in the same order; a test checks it).
+and `executor.py` (the two walk the kinds in the same order; a test checks it);
+removals live in `removal.py` (one list of steps read by plan, apply and verify).
 Column masks and row filters share one code path (`ExpressionKind` in
 `policy.py`).
 
@@ -54,13 +57,17 @@ the names.
   never silently reused. Align the YAML or the cluster (outside this tool,
   e.g. an in-place `PUT /api/v1/biac/expressions/rowFilter/{id}`), then
   re-plan. Identical text stays `SKIP (exists)`.
-- ❌ Pruning of entitlements not in the YAML — never deletes or revokes
-  anything
+- ✅ Removals, only what is declared under the root key `remove:` (grants,
+  location grants, mask / filter detaches and their orphan expressions,
+  assignments, whole roles): see "Removing entitlements (`remove:`)".
+  Nothing is deleted unless it is declared there.
+- ❌ Pruning of entitlements that are not in the YAML (`--prune`): out of
+  scope, the YAML is never taken as the full state of the cluster
 - ❌ In-place update of an existing grant/mask/filter's `effect` or
   `expression` — the BIAC API rejects a duplicate create for the same
   action+entity regardless of effect (409 ALREADY_EXISTS), so changing one
-  means deleting it on the cluster first, outside this tool, then re-running
-  `--apply`
+  means removing it first (list it under `remove:`, apply), then moving it
+  back to its creation section with the new value and applying again
 
 ## Requirements
 
@@ -134,6 +141,7 @@ validating.
 | [`column-masks.biac.yaml`](examples/column-masks.biac.yaml) | Partial mask, hash (pseudonymisation), `NULL`, and a mask that returns **another column** of the same row (with the column grant it needs). |
 | [`row-filters.biac.yaml`](examples/row-filters.biac.yaml) | Static filter, per-user perimeter from a mapping table (`current_user` subquery, with the grant on the mapping table), group-based filter (`current_groups()`), and a role without filter. |
 | [`functions.biac.yaml`](examples/functions.biac.yaml) | `EXECUTE` on one routine, `CREATE`/`DROP`/`EXECUTE`/`SHOW` on a whole routine schema, `DENY` on one routine, `ALLOW_WITH_GRANT_OPTION` for a view owner. |
+| [`remove.biac.yaml`](examples/remove.biac.yaml) | The `remove:` section: replace a column-level grant (create the new one, delete the old one), grants and location grants, detach a mask / filter with `delete_expression`, take a role away from a user and a group, delete a whole role. |
 | [`data-products-ai-ui.biac.yaml`](examples/data-products-ai-ui.biac.yaml) | Data products (whole domain, one product, publisher actions incl. `PUBLISH`), AI models (`allEntities: true`), UI features (`QUERY_EDITOR`, `CATALOG_EXPLORER`, `DATA_PRODUCTS`, `AI_MODELS`). |
 
 ```bash
@@ -142,7 +150,8 @@ python3 biac_deploy.py --env .env.mycluster --config examples/sample.biac.yaml -
 ```
 
 Only `sample.biac.yaml` is meant to be applied as is on a test cluster (it
-uses `tpch` and assigns `demo_*` accounts). The others reference placeholder
+uses `tpch` and assigns `demo_*` accounts). `remove.biac.yaml` is a catalogue
+of removal entries: `--dry-run` it, it is not a policy to apply. The others reference placeholder
 catalogs (`lakehouse`, `postgres`), groups and routines: adapt the names first.
 
 Actions used in the examples, by category (all applied on SEP 482-e lab
@@ -221,11 +230,137 @@ assignments:
     users: [<username>, ...]     # each must be listed in allowed_users
     groups: [<groupname>, ...]   # each must be listed in allowed_groups
 
+remove:                          # optional, see "Removing entitlements (`remove:`)"
+  grants: [...]                  # same entries as `grants:`
+  location_grants: [...]
+  column_masks: [...]            # name, role, entity [, delete_expression]
+  row_filters: [...]
+  assignments: [...]
+  roles: [<role name>, ...]
+
 # Guardrail declarations (root keys, all optional, all default to "nothing allowed")
 allowed_users: [<username>, ...]
 allowed_groups: [<groupname>, ...]
 allow_catalog_wide: [<catalog>, ...]
 ```
+
+## Removing entitlements (`remove:`)
+
+The root key `remove:` declares objects that must be **absent** from the
+cluster. It is the only way this tool deletes anything: an object that is not
+listed there is never touched, and the YAML is never read as "the full state"
+(there is no pruning). Each entry has the same format as in its creation
+section, so an entry can be cut from `grants:` (etc.) and pasted under
+`remove:`; keys that only matter for a creation (`expression`, `description`
+of a mask or filter) are accepted and ignored.
+
+```yaml
+remove:
+  grants:          # {role, effect, action (string or list), entity}
+    - {role: sample_reader, effect: ALLOW, action: SELECT, entity: {category: TABLES, catalog: tpch, schema: tiny, table: customer, columns: [custkey, name]}}
+  location_grants: # {role, location, grant_option?}
+    - {role: sample_reader, location: "s3://example-bucket/landing/*"}
+  column_masks:    # {name, role, entity, delete_expression?}
+    - {name: sample_customer_phone_mask, role: sample_reader, delete_expression: true, entity: {category: TABLES, catalog: tpch, schema: tiny, table: customer, columns: [phone]}}
+  row_filters:     # same shape (no columns)
+    - {name: sample_nation_europe_only, role: sample_reader, entity: {category: TABLES, catalog: tpch, schema: tiny, table: nation}}
+  assignments:     # {role, users?, groups?}: each account must be in allowed_users / allowed_groups
+    - {role: sample_reader, users: [demo_analyst]}
+  roles: [sample_legacy_role]   # the role itself, with everything attached to it
+```
+
+See [`examples/remove.biac.yaml`](examples/remove.biac.yaml).
+
+### What the plan shows
+
+Each entry becomes a line `[remove_<kind>] REMOVE <...>: DELETE` when the
+object exists, or `SKIP (absent)` when it does not (idempotent: a second run
+plans no `DELETE`). A `grants` entry with several actions gives one line per
+action. `--apply` without `--plan` prints `N object(s) will be DELETED` before
+the `yes` prompt (`--apply --plan` prints it too, there is no prompt).
+
+```
+=== Plan (dry-run, no changes made) ===
+[role] sample_reader: SKIP (exists)
+[grant] sample_reader -> ALLOW SELECT on tpch.tiny.customer.custkey,name,phone: CREATE
+[remove_grant] REMOVE sample_reader -> ALLOW SELECT on tpch.tiny.customer.custkey,name: DELETE
+[remove_grant] REMOVE sample_reader -> ALLOW INSERT on tpch.tiny.*: SKIP (absent)
+```
+
+### Matching rules
+
+| Entry | An object matches when |
+|---|---|
+| `grants` | same role, same `effect`, same `action` (one match per action of a list) and the same entity: category, catalog, schema, table or function, and the **sorted, lowercased `columns`** (so `[b, a]` matches `[A, B]`, but `[a]` does not match `[a, b]`) |
+| `location_grants` | same role, same `location`, same `grant_option` (default false) |
+| `column_masks` / `row_filters` | the expression `name` is attached to the role on the same entity. `expression` and `description` are not compared. An unknown expression name, or a role that does not exist, is `SKIP (absent)` |
+| `assignments` | the role is assigned to that user / group |
+| `roles` | the role exists |
+
+### Order: creations first, then removals
+
+`--apply` runs every creation (as before), then the removals, in this order:
+assignments, column-mask detaches, row-filter detaches, grants, location
+grants, orphan expressions (masks, then filters), roles. The plan prints them
+in that same order. Removals come **after** creations so that replacing an
+object never opens a gap in access: changing the column list of a grant is
+"create the new grant, then delete the old one" (see the example). Assignments
+go first and the role last, so an account stops using a role before what the
+role grants goes away.
+
+### `delete_expression: true`
+
+A detach removes the attachment (mask or filter on a role and a table), not the
+named expression. With `delete_expression: true` the expression is also
+deleted (`DELETE /api/v1/biac/expressions/{columnMask|rowFilter}/{id}`), but
+only if **no role anywhere** keeps it attached once the planned detaches are
+done (every role is scanned; the attachments removed by the same plan, role
+cascade included, do not count). Otherwise the plan is **refused**, listing the
+roles that still hold it: exit code 2, nothing written, in `--dry-run` as in
+`--apply`. Default: `false`, the expression stays on the cluster. An expression
+that is already gone is `SKIP (absent)`.
+
+### `remove.roles`
+
+The plan lists, one line each, everything attached to the role (assignments to
+users and groups, column masks, row filters, grants, location grants) in the
+stages above, then the role itself last. Expressions are not touched (use
+`delete_expression` on a `column_masks` / `row_filters` entry for that). A role
+that does not exist is `SKIP (absent)`. Ad-hoc deletion scripts (such as a
+`biac_delete_role.py`) are no longer needed for declared objects.
+
+### Failure handling
+
+A `DELETE` answered `200`, `202` or `204` is a success. Any other status stops
+the run immediately (fail closed): nothing after it is attempted, and what was
+deleted before is what is printed as `deleted` above the error. Re-run
+`--dry-run` to see what is left. With `--apply --plan`, the plan is recomputed
+first and the apply is refused (exit 3) on any difference, including a removal
+added or an object that has disappeared since.
+
+### Validation (offline, exit code 2)
+
+- unknown keys under `remove` or in its entries (a comma inside a flow-style
+  `action:` is caught like in `grants`);
+- never `sysadmin` / `public`, neither as the role to remove nor as the role
+  of any removed object;
+- an object cannot be both created and removed in one file (same identity: a
+  grant by role + effect + action + entity, a location grant, a mask or filter
+  by name + role + entity, an assignment by role + account). A `remove.roles`
+  role must not be declared in `roles:` nor referenced by a creation entry, and
+  `delete_expression` is refused for an expression that a creation section of
+  the file also declares;
+- roles named under `remove` need **not** be declared in `roles:` (they may be
+  legacy) but must match `^[a-z0-9_]+$`;
+- users / groups of `remove.assignments` must be in `allowed_users` /
+  `allowed_groups`;
+- entities follow the creation rules (no `'*'`, no `allEntities: true`, a
+  `table` for masks and filters, `columns` for masks).
+
+### `--verify`
+
+After the declared roles, `--verify` prints the `remove:` section with each
+object as `absent` or `STILL PRESENT`, and a count. Exit codes are unchanged.
 
 ## Guardrails (validator, fail closed)
 
@@ -238,6 +373,7 @@ These checks run before any network call, in every mode (`--dry-run`,
 | No `sysadmin` / `public` | A role named `sysadmin` or `public` (any case) cannot be declared, nor be the target of a grant, location grant, column mask, row filter or assignment. |
 | `allowed_users` / `allowed_groups` | Every user (resp. group) in `assignments` must be listed in the root `allowed_users` (resp. `allowed_groups`) of the same file. A missing key means an empty list: any assignment is then refused. Exact, case-sensitive match. The file thus names the accounts it may touch (demo accounts, in the lab). |
 | `allow_catalog_wide` | An `ALLOW` or `ALLOW_WITH_GRANT_OPTION` on a TABLES/FUNCTIONS entity **without `schema`** (whole catalog) is refused unless its catalog is listed in the root `allow_catalog_wide` (case-insensitive, per catalog). `DENY` and schema-scoped grants are not affected. |
+| `remove:` | The same guardrails apply to removals (see "Removing entitlements"): no `sysadmin` / `public`, accounts declared in `allowed_users` / `allowed_groups`, no object both created and removed, unknown keys refused. |
 | Expression name length | A `column_masks` / `row_filters` entry whose `name` is longer than 30 characters is refused, with the name and its length (BIAC API limit observed on SEP 482-e: `name: value may not be more than 30 characters`; it otherwise fails midway through `--apply`). Descriptions are capped at 250 characters. Role names: no limit documented or observed, so none is enforced. |
 
 ```yaml
@@ -279,9 +415,10 @@ Observed on a lab cluster (SEP 482-e, 2026-11-16), with secure views:
   `columns`. Adding or removing a column in a column-level grant therefore
   plans a **new** grant (`CREATE`); the old grant stays on the cluster.
   Grants are cumulative `ALLOW`s: the old grant keeps giving access to its
-  columns, so **removing a column from the YAML does not revoke it**. Delete
-  the superseded grant through the API (see "Known limitation"), then check
-  that a `--dry-run` plans no `CREATE`.
+  columns, so **removing a column from the YAML does not revoke it**. List the
+  superseded grant under `remove:` (see "Removing entitlements"): the new one
+  is created first, then the old one is deleted. Check that a following
+  `--dry-run` plans neither `CREATE` nor `DELETE`.
 - **A mask expression may reference another column of the same row**
   (e.g. expose `col_b`'s value in place of `col_a` for one role:
   `expression: "col_b"` on `columns: [col_a]`).
@@ -307,13 +444,19 @@ Observed on a lab cluster (SEP 482-e, 2026-11-16), with secure views:
   NOT reliably work (confirmed on a demo cluster — `PERMISSION_DENIED` despite
   the grant existing). Use an explicit per-table grant, or omit the field
   entirely for a real catalog/schema-wide grant (see above) — never `""`.
-- The script never deletes, revokes, or overwrites anything. Re-running it
-  against an unchanged config is a no-op (idempotent).
+- The script never deletes, revokes, or overwrites anything that is not
+  declared under `remove:`. Re-running it against an unchanged config is a
+  no-op (idempotent), removals included (`SKIP (absent)`).
+- A removal is as visible as a creation: it is in the plan (`REMOVE` lines),
+  in the signed plan's fingerprint, and counted before the `yes` prompt
+  (`N object(s) will be DELETED`). A removal that cannot be proven safe (an
+  expression still attached elsewhere) refuses the whole plan; a failed
+  `DELETE` stops the run at once.
 - `--apply` always prints the full plan and requires typing `yes` before
-  any write, whenever at least one object would be created — unless
+  any write, whenever at least one object would be created or deleted — unless
   `--plan <file>` is given: then there is no prompt and the apply only runs if
   the recomputed plan matches the signed one (see "Signed plan").
-- Never granted by this tool: anything on the roles `sysadmin` / `public`;
+- Never granted, nor deleted, by this tool: anything on the roles `sysadmin` / `public`;
   anything on a whole catalog without an explicit `allow_catalog_wide`;
   assignments of accounts not declared in `allowed_users` / `allowed_groups`.
 - Credentials live only in the file given by `--env`, parsed manually (never
@@ -325,20 +468,21 @@ Observed on a lab cluster (SEP 482-e, 2026-11-16), with secure views:
 
 ## Known limitation
 
-This tool can only CREATE grants/masks/filters that don't already exist —
-it cannot change the `effect` or `expression` of one that's already on the
-cluster (the BIAC API treats a grant as the same object once action+entity
-match, regardless of effect, and rejects a second create with 409
-ALREADY_EXISTS). To change one, delete it directly via the BIAC API first
-(outside this tool), then re-run `--apply` to recreate it from the YAML.
+This tool cannot change the `effect` or `expression` of a grant/mask/filter
+that is already on the cluster (the BIAC API treats a grant as the same object
+once action+entity match, regardless of effect, and rejects a second create
+with 409 ALREADY_EXISTS). To change one: list it under `remove:` and apply,
+then move it back to its creation section with the new value and apply again
+(one file cannot create and remove the same object, and doing it in two runs
+leaves a short gap in access).
 
-The same applies to a column-level grant whose column list changes: the new
-grant is created, the old one is not removed (see "Column-level grants and
-column masks: behaviour").
+A column-level grant whose column list changes has no such gap: the new grant
+is a different object, so it is created and the old one removed in the same
+run, creations first (see "Column-level grants and column masks: behaviour").
 
-Deletion routes used successfully on the lab (SEP 482-e, `sysadmin` role,
-not covered by this repo's documentation of the API; check the response
-status of each call):
+Deleting is only possible for what is declared under `remove:`; there is no
+pruning mode. The DELETE routes (confirmed on the lab, SEP 482-e, `sysadmin`
+role; not covered by this repo's documentation of the API) are:
 
 | Object | Route |
 |---|---|
@@ -349,9 +493,13 @@ status of each call):
 | Role (once empty) | `DELETE /api/v1/biac/roles/{roleId}` |
 | Orphan expression | `DELETE /api/v1/biac/expressions/{rowFilter\|columnMask}/{id}` |
 
-Ids come from the matching `GET` on the same path. In a user assignment the
-subject's name is under `username`. Delete with a dry-run first and re-read
-the state afterwards; never touch `sysadmin` / `public`.
+Ids come from the matching `GET` on the same path. In a role's assignments
+(`GET /roles/{id}/assignments`) the subject's name is under `username` (user)
+or `groupName` (group); any other shape stops the plan. User and group names
+are URL-encoded as one path segment. `remove.assignments` reads the ids from
+the per-subject listing (`GET /subjects/{users|groups}/{name}/assignments`),
+assumed to carry the same assignment ids as the per-role listing (not yet
+checked on a cluster).
 
 ## Tests
 

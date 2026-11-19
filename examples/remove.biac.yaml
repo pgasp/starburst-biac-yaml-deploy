@@ -1,0 +1,57 @@
+# Removing entitlements with the root key `remove:` ("ensure absent"). Generic example on the
+# built-in `tpch` catalog, no customer data.
+#
+#   python3 biac_deploy.py --config examples/remove.biac.yaml --validate
+#   python3 biac_deploy.py --env .env.mycluster --config examples/remove.biac.yaml --dry-run
+#
+# Nothing is ever deleted unless it is listed under `remove:`. Each entry has the same format as in
+# its creation section, so an entry can be cut from `grants:` (etc.) and pasted under `remove:`.
+# The plan shows `DELETE` when the object exists and `SKIP (absent)` otherwise, so a second run
+# does nothing. Removals run AFTER every creation, in this order: assignments, column-mask
+# detaches, row-filter detaches, grants, location grants, orphan expressions, roles.
+#
+# An object cannot be created and removed in the same file (the validator refuses it).
+
+roles:
+  - name: sample_reader
+
+# 1. Change the column list of a column-level grant, without any gap in access: the new grant
+#    is created first, then the old one is deleted. (Without the `remove:` entry below, the old
+#    grant would stay on the cluster and keep giving access to its columns.)
+grants:
+  - {role: sample_reader, effect: ALLOW, action: SELECT, entity: {category: TABLES, catalog: tpch, schema: tiny, table: customer, columns: [custkey, name, nationkey, mktsegment]}}
+
+remove:
+  grants:
+    # Exact match: effect + action + entity, columns included (order and case do not matter).
+    - {role: sample_reader, effect: ALLOW, action: SELECT, entity: {category: TABLES, catalog: tpch, schema: tiny, table: customer, columns: [custkey, name, nationkey]}}
+    # A list of actions removes each of them (the ones that do not exist are `SKIP (absent)`).
+    - {role: sample_reader, effect: ALLOW, action: [INSERT, DELETE], entity: {category: TABLES, catalog: tpch, schema: tiny}}
+
+  location_grants:
+    - {role: sample_reader, location: "s3://example-bucket/landing/*", grant_option: false}
+
+  # 2. Detach a mask / a row filter from a role. `delete_expression: true` also deletes the named
+  #    expression, but only if no role keeps it attached once the planned detaches are done:
+  #    otherwise the plan is refused (exit code 2, nothing written). Default: false (kept).
+  column_masks:
+    - name: sample_customer_phone_mask
+      role: sample_reader
+      delete_expression: true
+      entity: {category: TABLES, catalog: tpch, schema: tiny, table: customer, columns: [phone]}
+
+  row_filters:
+    - {name: sample_nation_europe_only, role: sample_reader, entity: {category: TABLES, catalog: tpch, schema: tiny, table: nation}}
+
+  # 3. Take a role away from an account (it must be listed in allowed_users / allowed_groups).
+  assignments:
+    - {role: sample_reader, users: [demo_analyst], groups: [demo_auditors]}
+
+  # 4. Delete a whole role. The plan first lists everything attached to it (assignments, masks,
+  #    filters, grants, location grants), then the role. A role listed here may be undeclared in
+  #    `roles:` (legacy), but must not be declared there nor used by any creation entry.
+  roles: [sample_legacy_role]
+
+# The accounts whose assignments this file may touch (also for `remove.assignments`).
+allowed_users: [demo_analyst]
+allowed_groups: [demo_auditors]
